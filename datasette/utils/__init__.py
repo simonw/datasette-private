@@ -5,7 +5,9 @@ import click
 from collections import OrderedDict, namedtuple, Counter
 import copy
 import dataclasses
+import datetime
 import base64
+from decimal import Decimal
 import hashlib
 import inspect
 import json
@@ -235,6 +237,12 @@ class CustomJSONEncoder(json.JSONEncoder):
                     "$base64": True,
                     "encoded": base64.b64encode(obj).decode("latin1"),
                 }
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.isoformat()
+        if isinstance(obj, datetime.timedelta):
+            return str(obj)
+        if isinstance(obj, Decimal):
+            return float(obj)
         return json.JSONEncoder.default(self, obj)
 
 
