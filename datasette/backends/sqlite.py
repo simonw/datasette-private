@@ -751,6 +751,74 @@ class SQLiteBackend(DatabaseBackend):
         else:
             return "db"
 
+    # ---- Write operations ----
+
+    def table_schema_string(self, conn, table_name):
+        import sqlite_utils
+
+        return sqlite_utils.Database(conn)[table_name].schema
+
+    def write_insert_rows(
+        self,
+        conn,
+        table_name,
+        rows,
+        pk=None,
+        alter=False,
+        ignore=False,
+        replace=False,
+        return_rows=False,
+    ):
+        import sqlite_utils
+
+        table = sqlite_utils.Database(conn)[table_name]
+        kwargs = {"ignore": ignore, "replace": replace, "alter": alter}
+        if pk is not None:
+            kwargs["pk"] = pk
+        if return_rows:
+            rowids = []
+            for row in rows:
+                rowids.append(table.insert(row, **kwargs).last_rowid)
+            return list(
+                table.rows_where(
+                    "rowid in ({})".format(",".join("?" for _ in rowids)),
+                    rowids,
+                )
+            )
+        else:
+            table.insert_all(rows, **kwargs)
+            return None
+
+    def write_upsert_rows(self, conn, table_name, rows, pk=None, alter=False):
+        import sqlite_utils
+
+        table = sqlite_utils.Database(conn)[table_name]
+        table.upsert_all(rows, pk=pk, alter=alter)
+
+    def write_delete_row(self, conn, table_name, pks, pk_values):
+        import sqlite_utils
+
+        pk_val = pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+        sqlite_utils.Database(conn)[table_name].delete(pk_val)
+
+    def write_update_row(self, conn, table_name, pks, pk_values, updates, alter=False):
+        import sqlite_utils
+
+        pk_val = pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+        sqlite_utils.Database(conn)[table_name].update(pk_val, updates, alter=alter)
+
+    def write_drop_table(self, conn, table_name):
+        import sqlite_utils
+
+        sqlite_utils.Database(conn)[table_name].drop()
+
+    def write_create_table(self, conn, table_name, columns, pk=None):
+        import sqlite_utils
+
+        db = sqlite_utils.Database(conn)
+        db[table_name].create(columns, pk=pk)
+        return db[table_name].schema
+
 
 def _apply_write_wrapper(fn, wrapper_factory):
     def wrapped(conn):

@@ -214,3 +214,63 @@ class DatabaseBackend(ABC):
     def suggest_name(self) -> str:
         """Suggest a name for this database based on connection info."""
         return "db"
+
+    # ---- Write operations ----
+    # These allow views to perform writes without depending on sqlite_utils.
+
+    def table_schema_string(self, conn: Any, table_name: str) -> Optional[str]:
+        """Return a CREATE TABLE statement string for a table."""
+        return self.get_table_definition(conn, table_name)
+
+    def write_insert_rows(
+        self,
+        conn: Any,
+        table_name: str,
+        rows: List[Dict],
+        pk: Any = None,
+        alter: bool = False,
+        ignore: bool = False,
+        replace: bool = False,
+        return_rows: bool = False,
+    ) -> Optional[List[Dict]]:
+        """Insert rows into a table. Returns list of row dicts if return_rows."""
+        raise NotImplementedError
+
+    def write_upsert_rows(
+        self,
+        conn: Any,
+        table_name: str,
+        rows: List[Dict],
+        pk: Any = None,
+        alter: bool = False,
+    ) -> None:
+        """Upsert rows (insert or update on conflict)."""
+        raise NotImplementedError
+
+    def write_delete_row(
+        self, conn: Any, table_name: str, pks: List[str], pk_values: List
+    ) -> None:
+        """Delete a row by primary key."""
+        raise NotImplementedError
+
+    def write_update_row(
+        self,
+        conn: Any,
+        table_name: str,
+        pks: List[str],
+        pk_values: List,
+        updates: Dict,
+        alter: bool = False,
+    ) -> None:
+        """Update a row by primary key."""
+        raise NotImplementedError
+
+    def write_drop_table(self, conn: Any, table_name: str) -> None:
+        """Drop a table."""
+        raise NotImplementedError
+
+    def write_create_table(
+        self, conn: Any, table_name: str, columns: Dict[str, str], pk: Any = None
+    ) -> str:
+        """Create a table. columns is {name: type_str}. Returns schema string."""
+        raise NotImplementedError

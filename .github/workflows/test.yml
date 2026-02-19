@@ -81,4 +81,4 @@ jobs:
       env:
         DATASETTE_TEST_POSTGRESQL: postgresql://postgres:postgres@localhost:5432/datasette_test
       run: |
-        pytest tests/test_backends.py -v
+        pytest tests/test_backends.py tests/test_backends_integration.py tests/test_api_write.py -v

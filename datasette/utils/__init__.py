@@ -1318,13 +1318,14 @@ def truncate_url(url, length):
 
 async def row_sql_params_pks(db, table, pk_values):
     pks = await db.primary_keys(table)
+    escape = db.escape_identifier
     use_rowid = not pks
     select = "*"
     if use_rowid:
         select = "rowid, *"
         pks = ["rowid"]
-    wheres = [f'"{pk}"=:p{i}' for i, pk in enumerate(pks)]
-    sql = f"select {select} from {escape_sqlite(table)} where {' AND '.join(wheres)}"
+    wheres = [f'{escape(pk)}=:p{i}' for i, pk in enumerate(pks)]
+    sql = f"select {select} from {escape(table)} where {' AND '.join(wheres)}"
     params = {}
     for i, pk_value in enumerate(pk_values):
         params[f"p{i}"] = pk_value

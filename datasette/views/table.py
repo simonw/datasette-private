@@ -42,7 +42,6 @@ from datasette.utils import (
 )
 from datasette.utils.asgi import BadRequest, Forbidden, NotFound, Response
 from datasette.filters import Filters
-import sqlite_utils
 from .base import BaseView, DatasetteError, _error, stream_csv
 from .database import QueryView
 
@@ -488,7 +487,9 @@ class TableInsertView(BaseView):
         # No that we've passed pks to _validate_data it's safe to
         # fix the rowids case:
         if not pks:
-            pks = ["rowid"]
+            if db.backend.backend_type == "sqlite":
+                pks = ["rowid"]
+            # For non-SQLite backends, pks stays empty
 
         ignore = extras.get("ignore")
         replace = extras.get("replace")
@@ -515,7 +516,7 @@ class TableInsertView(BaseView):
                 return _error(["Permission denied for alter-table"], 403)
             # Track initial schema to check if it changed later
             initial_schema = await db.execute_fn(
-                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+                lambda conn: db.backend.table_schema_string(conn, table_name)
             )
 
         should_return = bool(extras.get("return", False))
@@ -524,30 +525,17 @@ class TableInsertView(BaseView):
             row_pk_values_for_later = [tuple(row[pk] for pk in pks) for row in rows]
 
         def insert_or_upsert_rows(conn):
-            table = sqlite_utils.Database(conn)[table_name]
-            kwargs = {}
+            pk_for_backend = pks[0] if len(pks) == 1 else pks if pks else None
             if upsert:
-                kwargs = {
-                    "pk": pks[0] if len(pks) == 1 else pks,
-                    "alter": alter,
-                }
-            else:
-                # Insert
-                kwargs = {"ignore": ignore, "replace": replace, "alter": alter}
-            if should_return and not upsert:
-                rowids = []
-                method = table.upsert if upsert else table.insert
-                for row in rows:
-                    rowids.append(method(row, **kwargs).last_rowid)
-                return list(
-                    table.rows_where(
-                        "rowid in ({})".format(",".join("?" for _ in rowids)),
-                        rowids,
-                    )
+                db.backend.write_upsert_rows(
+                    conn, table_name, rows, pk=pk_for_backend, alter=alter,
                 )
+                return None
             else:
-                method_all = table.upsert_all if upsert else table.insert_all
-                method_all(rows, **kwargs)
+                return db.backend.write_insert_rows(
+                    conn, table_name, rows, pk=pk_for_backend, alter=alter,
+                    ignore=ignore, replace=replace, return_rows=should_return,
+                )
 
         try:
             rows = await db.execute_write_fn(insert_or_upsert_rows, request=request)
@@ -557,14 +545,16 @@ class TableInsertView(BaseView):
         if should_return:
             if upsert:
                 # Fetch based on initial input IDs
+                escape = db.escape_identifier
                 where_clause = " OR ".join(
-                    ["({})".format(" AND ".join("{} = ?".format(pk) for pk in pks))]
+                    ["({})".format(" AND ".join("{} = ?".format(escape(pk)) for pk in pks))]
                     * len(row_pk_values_for_later)
                 )
                 args = list(itertools.chain.from_iterable(row_pk_values_for_later))
+                select_prefix = "rowid, " if pks == ["rowid"] else ""
                 fetched_rows = await db.execute(
-                    "select {}* from [{}] where {}".format(
-                        "rowid, " if pks == ["rowid"] else "", table_name, where_clause
+                    "select {}* from {} where {}".format(
+                        select_prefix, escape(table_name), where_clause
                     ),
                     args,
                 )
@@ -596,7 +586,7 @@ class TableInsertView(BaseView):
 
         if initial_schema is not None:
             after_schema = await db.execute_fn(
-                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+                lambda conn: db.backend.table_schema_string(conn, table_name)
             )
             if initial_schema != after_schema:
                 await self.ds.track_event(
@@ -653,13 +643,14 @@ class TableDropView(BaseView):
             pass
 
         if not confirm:
+            escape = db.escape_identifier
             return Response.json(
                 {
                     "ok": True,
                     "database": database_name,
                     "table": table_name,
                     "row_count": (
-                        await db.execute("select count(*) from [{}]".format(table_name))
+                        await db.execute("select count(*) from {}".format(escape(table_name)))
                     ).single_value(),
                     "message": 'Pass "confirm": true to confirm',
                 },
@@ -668,7 +659,7 @@ class TableDropView(BaseView):
 
         # Drop table
         def drop_table(conn):
-            sqlite_utils.Database(conn)[table_name].drop()
+            db.backend.write_drop_table(conn, table_name)
 
         await db.execute_write_fn(drop_table, request=request)
         await self.ds.track_event(

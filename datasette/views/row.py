@@ -10,7 +10,6 @@ from datasette.utils import (
 )
 from datasette.plugins import pm
 import json
-import sqlite_utils
 from .table import display_columns_and_rows, _get_extras
 
 
@@ -241,9 +240,11 @@ class RowDeleteView(BaseView):
         if not ok:
             return resolved
 
-        # Delete table
+        # Delete row
         def delete_row(conn):
-            sqlite_utils.Database(conn)[resolved.table].delete(resolved.pk_values)
+            resolved.db.backend.write_delete_row(
+                conn, resolved.table, resolved.pks, resolved.pk_values
+            )
 
         try:
             await resolved.db.execute_write_fn(delete_row, request=request)
@@ -301,8 +302,9 @@ class RowUpdateView(BaseView):
             return _error(["Permission denied for alter-table"], 403)
 
         def update_row(conn):
-            sqlite_utils.Database(conn)[resolved.table].update(
-                resolved.pk_values, update, alter=alter
+            resolved.db.backend.write_update_row(
+                conn, resolved.table, resolved.pks, resolved.pk_values,
+                update, alter=alter,
             )
 
         try:

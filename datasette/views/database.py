@@ -7,7 +7,6 @@ import json
 import markupsafe
 import os
 import re
-import sqlite_utils
 import textwrap
 
 from datasette.events import AlterTableEvent, CreateTableEvent, InsertRowsEvent
@@ -1100,21 +1099,23 @@ class TableCreateView(BaseView):
         initial_schema = None
         if table_exists:
             initial_schema = await db.execute_fn(
-                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+                lambda conn: db.backend.table_schema_string(conn, table_name)
             )
 
         def create_table(conn):
-            table = sqlite_utils.Database(conn)[table_name]
+            combined_pk = pks or pk
             if rows:
-                table.insert_all(
-                    rows, pk=pks or pk, ignore=ignore, replace=replace, alter=alter
+                db.backend.write_insert_rows(
+                    conn, table_name, rows, pk=combined_pk,
+                    ignore=ignore, replace=replace, alter=alter,
                 )
             else:
-                table.create(
+                db.backend.write_create_table(
+                    conn, table_name,
                     {c["name"]: c["type"] for c in columns},
-                    pk=pks or pk,
+                    pk=combined_pk,
                 )
-            return table.schema
+            return db.backend.table_schema_string(conn, table_name)
 
         try:
             schema = await db.execute_write_fn(create_table, request=request)

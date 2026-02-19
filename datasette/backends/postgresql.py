@@ -998,6 +998,220 @@ class PostgresBackend(DatabaseBackend):
                 return db_name
         return "db"
 
+    # ---- Write operations ----
+
+    def table_schema_string(self, conn, table_name):
+        return self.get_table_definition(conn, table_name)
+
+    def _pg_type_for_value(self, value):
+        if isinstance(value, bool):
+            return "BOOLEAN"
+        if isinstance(value, int):
+            return "INTEGER"
+        if isinstance(value, float):
+            return "DOUBLE PRECISION"
+        if isinstance(value, bytes):
+            return "BYTEA"
+        return "TEXT"
+
+    def _ensure_columns(self, conn, table_name, rows, pk=None, alter=False):
+        """Create table if needed, or alter to add missing columns."""
+        escape = self.escape_identifier
+        table_exists = self.table_exists(conn, table_name)
+
+        if not table_exists:
+            # Infer columns from rows
+            all_columns = {}
+            for row in rows:
+                for col, val in row.items():
+                    if col not in all_columns:
+                        all_columns[col] = self._pg_type_for_value(val)
+            pk_list = [pk] if isinstance(pk, str) else (pk or [])
+            # Add auto-increment PK columns not present in rows
+            for pk_col in pk_list:
+                if pk_col not in all_columns:
+                    all_columns[pk_col] = "SERIAL"
+            # Build column defs in order: PK columns first, then data columns
+            col_defs = []
+            for col_name in pk_list:
+                if col_name in all_columns:
+                    col_defs.append(f"{escape(col_name)} {all_columns[col_name]}")
+            for col_name, col_type in all_columns.items():
+                if col_name not in pk_list:
+                    col_defs.append(f"{escape(col_name)} {col_type}")
+            if pk_list:
+                pk_str = ", ".join(escape(c) for c in pk_list)
+                col_defs.append(f"PRIMARY KEY ({pk_str})")
+            sql = "CREATE TABLE {} ({})".format(
+                escape(table_name), ", ".join(col_defs)
+            )
+            conn.execute(sql)
+        elif alter:
+            existing_cols = set(self.table_columns(conn, table_name))
+            for row in rows:
+                for col, val in row.items():
+                    if col not in existing_cols:
+                        col_type = self._pg_type_for_value(val)
+                        conn.execute(
+                            "ALTER TABLE {} ADD COLUMN {} {}".format(
+                                escape(table_name), escape(col), col_type
+                            )
+                        )
+                        existing_cols.add(col)
+
+    def write_insert_rows(
+        self,
+        conn,
+        table_name,
+        rows,
+        pk=None,
+        alter=False,
+        ignore=False,
+        replace=False,
+        return_rows=False,
+    ):
+        if not rows:
+            return [] if return_rows else None
+
+        escape = self.escape_identifier
+        self._ensure_columns(conn, table_name, rows, pk=pk, alter=alter)
+
+        pk_list = [pk] if isinstance(pk, str) else (pk or [])
+
+        # Collect all column names across all rows
+        all_cols = list(dict.fromkeys(col for row in rows for col in row))
+        col_str = ", ".join(escape(c) for c in all_cols)
+
+        # Build conflict clause
+        conflict_clause = ""
+        if pk_list and ignore:
+            conflict_clause = " ON CONFLICT DO NOTHING"
+        elif pk_list and replace:
+            non_pk_cols = [c for c in all_cols if c not in pk_list]
+            if non_pk_cols:
+                update_parts = ", ".join(
+                    "{} = EXCLUDED.{}".format(escape(c), escape(c))
+                    for c in non_pk_cols
+                )
+                pk_str = ", ".join(escape(c) for c in pk_list)
+                conflict_clause = (
+                    " ON CONFLICT ({}) DO UPDATE SET {}".format(pk_str, update_parts)
+                )
+            else:
+                conflict_clause = " ON CONFLICT DO NOTHING"
+
+        returning = " RETURNING *" if return_rows else ""
+        all_returned = []
+
+        for row in rows:
+            placeholders = ", ".join("%s" for _ in all_cols)
+            values = [row.get(c) for c in all_cols]
+            sql = "INSERT INTO {} ({}) VALUES ({}){}{}".format(
+                escape(table_name), col_str, placeholders,
+                conflict_clause, returning,
+            )
+            cursor = conn.execute(sql, values)
+            if return_rows:
+                result_rows = cursor.fetchall()
+                for r in result_rows:
+                    all_returned.append(dict(zip(r.keys(), r)))
+
+        return all_returned if return_rows else None
+
+    def write_upsert_rows(self, conn, table_name, rows, pk=None, alter=False):
+        if not rows:
+            return
+
+        escape = self.escape_identifier
+        self._ensure_columns(conn, table_name, rows, pk=pk, alter=alter)
+
+        pk_list = [pk] if isinstance(pk, str) else (pk or [])
+
+        for row in rows:
+            cols = list(row.keys())
+            col_str = ", ".join(escape(c) for c in cols)
+            placeholders = ", ".join("%s" for _ in cols)
+            values = list(row.values())
+
+            non_pk_cols = [c for c in cols if c not in pk_list]
+            if non_pk_cols:
+                update_parts = ", ".join(
+                    "{} = EXCLUDED.{}".format(escape(c), escape(c))
+                    for c in non_pk_cols
+                )
+                pk_str = ", ".join(escape(c) for c in pk_list)
+                conflict_clause = (
+                    " ON CONFLICT ({}) DO UPDATE SET {}".format(pk_str, update_parts)
+                )
+            else:
+                pk_str = ", ".join(escape(c) for c in pk_list)
+                conflict_clause = " ON CONFLICT ({}) DO NOTHING".format(pk_str)
+
+            sql = "INSERT INTO {} ({}) VALUES ({}){}".format(
+                escape(table_name), col_str, placeholders, conflict_clause,
+            )
+            conn.execute(sql, values)
+
+    def write_delete_row(self, conn, table_name, pks, pk_values):
+        escape = self.escape_identifier
+        where_parts = ["{} = %s".format(escape(pk)) for pk in pks]
+        sql = "DELETE FROM {} WHERE {}".format(
+            escape(table_name), " AND ".join(where_parts)
+        )
+        conn.execute(sql, list(pk_values))
+
+    def write_update_row(
+        self, conn, table_name, pks, pk_values, updates, alter=False
+    ):
+        escape = self.escape_identifier
+
+        if alter:
+            existing_cols = set(self.table_columns(conn, table_name))
+            for col, val in updates.items():
+                if col not in existing_cols:
+                    col_type = self._pg_type_for_value(val)
+                    conn.execute(
+                        "ALTER TABLE {} ADD COLUMN {} {}".format(
+                            escape(table_name), escape(col), col_type
+                        )
+                    )
+                    existing_cols.add(col)
+
+        set_parts = ["{} = %s".format(escape(col)) for col in updates]
+        where_parts = ["{} = %s".format(escape(pk)) for pk in pks]
+        sql = "UPDATE {} SET {} WHERE {}".format(
+            escape(table_name),
+            ", ".join(set_parts),
+            " AND ".join(where_parts),
+        )
+        params = list(updates.values()) + list(pk_values)
+        conn.execute(sql, params)
+
+    def write_drop_table(self, conn, table_name):
+        conn.execute("DROP TABLE {}".format(self.escape_identifier(table_name)))
+
+    def write_create_table(self, conn, table_name, columns, pk=None):
+        escape = self.escape_identifier
+        _type_map = {
+            "text": "TEXT",
+            "integer": "INTEGER",
+            "float": "DOUBLE PRECISION",
+            "blob": "BYTEA",
+        }
+        pk_list = [pk] if isinstance(pk, str) else (pk or [])
+        col_defs = []
+        for col_name, col_type in columns.items():
+            pg_type = _type_map.get(col_type, col_type.upper())
+            col_defs.append("{} {}".format(escape(col_name), pg_type))
+        if pk_list:
+            pk_str = ", ".join(escape(c) for c in pk_list)
+            col_defs.append("PRIMARY KEY ({})".format(pk_str))
+        sql = "CREATE TABLE {} ({})".format(
+            escape(table_name), ", ".join(col_defs)
+        )
+        conn.execute(sql)
+        return self.get_table_definition(conn, table_name)
+
 
 def _apply_write_wrapper(fn, wrapper_factory):
     def wrapped(conn):
