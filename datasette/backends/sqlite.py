@@ -702,6 +702,22 @@ class SQLiteBackend(DatabaseBackend):
         rows = conn.execute(f"PRAGMA index_list([{table}])").fetchall()
         return [dict(r) for r in rows]
 
+    def label_column_details(self, conn, table):
+        import sqlite_utils
+
+        db = sqlite_utils.Database(conn)
+        columns = db[table].columns_dict
+        indexes = db[table].indexes
+        details = {}
+        for name in columns:
+            is_unique = any(
+                index
+                for index in indexes
+                if index.columns == [name] and index.unique
+            )
+            details[name] = (columns[name], is_unique)
+        return details
+
     def detect_fts(self, conn, table):
         sql = r"""
             select name from sqlite_master

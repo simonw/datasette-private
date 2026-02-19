@@ -235,18 +235,7 @@ class Database:
             return explicit_label_column
 
         def column_details(conn):
-            db = sqlite_utils.Database(conn)
-            columns = db[table].columns_dict
-            indexes = db[table].indexes
-            details = {}
-            for name in columns:
-                is_unique = any(
-                    index
-                    for index in indexes
-                    if index.columns == [name] and index.unique
-                )
-                details[name] = (columns[name], is_unique)
-            return details
+            return self.backend.label_column_details(conn, table)
 
         column_details = await self.execute_fn(column_details)
         unique_text_columns = [

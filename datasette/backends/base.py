@@ -195,6 +195,10 @@ class DatabaseBackend(ABC):
         """Return list of index dicts for a table. Default: empty."""
         return []
 
+    def label_column_details(self, conn: Any, table: str) -> Dict:
+        """Return {column_name: (python_type, is_unique)} for label column detection."""
+        return {}
+
     def detect_fts(self, conn: Any, table: str) -> Optional[str]:
         """Return the name of the FTS table for this table, if any."""
         return None

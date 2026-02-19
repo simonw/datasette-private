@@ -171,9 +171,13 @@ class PostgresBackend(DatabaseBackend):
 
             with self.time_limit_context(conn, time_limit_ms):
                 try:
-                    cursor = conn.execute(
-                        translated_sql, params if params is not None else {}
-                    )
+                    if isinstance(params, (list, tuple)):
+                        pg_params = tuple(params)
+                    elif params is not None:
+                        pg_params = params
+                    else:
+                        pg_params = {}
+                    cursor = conn.execute(translated_sql, pg_params)
                     max_returned_rows = (
                         self.ds.max_returned_rows if self.ds else 100
                     )
@@ -375,8 +379,13 @@ class PostgresBackend(DatabaseBackend):
     # ---- SQL dialect ----
 
     def translate_sql(self, sql):
-        """Convert :name params to %(name)s for psycopg, preserving :: casts."""
-        return _param_re.sub(r"%(\1)s", sql)
+        """Convert :name params to %(name)s and ? to %s for psycopg, preserving :: casts."""
+        # First convert :name to %(name)s
+        sql = _param_re.sub(r"%(\1)s", sql)
+        # Then convert ? positional placeholders to %s
+        # Be careful not to convert ?? (which would be a literal ?)
+        sql = re.sub(r"(?<!\?)\?(?!\?)", "%s", sql)
+        return sql
 
     def escape_identifier(self, identifier):
         if _boring_keyword_re.match(identifier) and (
@@ -634,6 +643,49 @@ class PostgresBackend(DatabaseBackend):
             {"schema": schema, "table": table},
         ).fetchall()
         return [{"name": r[0], "unique": r[1], "sql": r[2]} for r in rows]
+
+    def label_column_details(self, conn, table):
+        schema = self.schema or "public"
+        # Get column names and types
+        col_rows = conn.execute(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %(schema)s
+              AND table_name = %(table)s
+            ORDER BY ordinal_position
+            """,
+            {"schema": schema, "table": table},
+        ).fetchall()
+        # Find unique single-column indexes
+        unique_cols = set()
+        idx_rows = conn.execute(
+            """
+            SELECT a.attname
+            FROM pg_index ix
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+            WHERE n.nspname = %(schema)s
+              AND t.relname = %(table)s
+              AND ix.indisunique = true
+              AND ix.indnatts = 1
+            """,
+            {"schema": schema, "table": table},
+        ).fetchall()
+        for r in idx_rows:
+            unique_cols.add(r[0])
+        # Map PG types to Python types for label detection
+        _text_types = {
+            "text", "character varying", "varchar", "char", "character",
+            "name", "citext",
+        }
+        details = {}
+        for col_name, data_type in col_rows:
+            py_type = str if data_type in _text_types else type(None)
+            details[col_name] = (py_type, col_name in unique_cols)
+        return details
 
     def detect_fts(self, conn, table):
         # PostgreSQL doesn't use SQLite-style FTS tables
