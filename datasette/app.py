@@ -381,6 +381,19 @@ class Datasette:
         else:
             self._internal_database = Database(self, path=internal, mode="rwc")
         self._internal_database.name = INTERNAL_DB_NAME
+        if hasattr(self._internal_database, "backend"):
+            self._internal_database.backend._database_name = INTERNAL_DB_NAME
+
+        # Backend registry - maps scheme/type to backend class
+        from .backends.sqlite import SQLiteBackend
+
+        self._backend_registry = {"sqlite": SQLiteBackend}
+        try:
+            from .backends.postgresql import PostgresBackend
+
+            self._backend_registry["postgresql"] = PostgresBackend
+        except ImportError:
+            pass
 
         self.cache_headers = cache_headers
         self.cors = cors
@@ -620,7 +633,9 @@ class Datasette:
                 [stale_db_name],
             )
         for database_name, db in self.databases.items():
-            schema_version = (await db.execute("PRAGMA schema_version")).first()[0]
+            schema_version = await db.execute_fn(
+                lambda conn: db.backend.schema_version(conn)
+            )
             # Compare schema versions to see if we should skip it
             if schema_version == current_schema_versions.get(database_name):
                 continue
@@ -690,6 +705,14 @@ class Datasette:
                     if action.abbr:
                         action_abbrs[action.abbr] = action
                     self.actions[action.name] = action
+
+        # Register database backends from plugins
+        for hook in pm.hook.register_database_backends(datasette=self):
+            backends = await await_me_maybe(hook)
+            if backends:
+                for backend_cls in backends:
+                    if hasattr(backend_cls, "backend_type"):
+                        self._backend_registry[backend_cls.backend_type] = backend_cls
 
         for hook in pm.hook.prepare_jinja2_environment(
             env=self._jinja_env, datasette=self
@@ -776,6 +799,9 @@ class Datasette:
             i += 1
         db.name = name
         db.route = route or name
+        # Tell the backend its database name for tracing etc.
+        if hasattr(db, "backend"):
+            db.backend._database_name = name
         new_databases[name] = db
         # don't mutate! that causes race conditions with live import
         self.databases = new_databases
@@ -991,23 +1017,41 @@ class Datasette:
             return query
 
     def _prepare_connection(self, conn, database):
-        conn.row_factory = sqlite3.Row
-        conn.text_factory = lambda x: str(x, "utf-8", "replace")
-        if self.sqlite_extensions and database != INTERNAL_DB_NAME:
-            conn.enable_load_extension(True)
-            for extension in self.sqlite_extensions:
-                # "extension" is either a string path to the extension
-                # or a 2-item tuple that specifies which entrypoint to load.
-                if isinstance(extension, tuple):
-                    path, entrypoint = extension
-                    conn.execute("SELECT load_extension(?, ?)", [path, entrypoint])
-                else:
-                    conn.execute("SELECT load_extension(?)", [extension])
-        if self.setting("cache_size_kb"):
-            conn.execute(f"PRAGMA cache_size=-{self.setting('cache_size_kb')}")
+        # Delegate backend-specific setup to the backend object
+        db_obj = self.databases.get(database) or (
+            self._internal_database if database == INTERNAL_DB_NAME else None
+        )
+        if db_obj and hasattr(db_obj, "backend"):
+            db_obj.backend.prepare_connection(conn, self, database)
+        else:
+            # Fallback for internal DB or when backend not available yet
+            conn.row_factory = sqlite3.Row
+            conn.text_factory = lambda x: str(x, "utf-8", "replace")
+            if self.sqlite_extensions and database != INTERNAL_DB_NAME:
+                conn.enable_load_extension(True)
+                for extension in self.sqlite_extensions:
+                    if isinstance(extension, tuple):
+                        path, entrypoint = extension
+                        conn.execute(
+                            "SELECT load_extension(?, ?)", [path, entrypoint]
+                        )
+                    else:
+                        conn.execute("SELECT load_extension(?)", [extension])
+            if self.setting("cache_size_kb"):
+                conn.execute(
+                    f"PRAGMA cache_size=-{self.setting('cache_size_kb')}"
+                )
+
         # pylint: disable=no-member
-        if database != INTERNAL_DB_NAME:
+        # Call prepare_connection plugin hook only for SQLite backends
+        is_sqlite = (
+            not db_obj
+            or not hasattr(db_obj, "backend")
+            or db_obj.backend.backend_type == "sqlite"
+        )
+        if database != INTERNAL_DB_NAME and is_sqlite:
             pm.hook.prepare_connection(conn=conn, database=database, datasette=self)
+
         # If self.crossdb and this is _memory, connect the first SQLITE_LIMIT_ATTACHED databases
         if self.crossdb and database == "_memory":
             count = 0

@@ -1,5 +1,4 @@
 import textwrap
-from datasette.utils import table_column_details
 
 
 async def init_internal_db(db):
@@ -108,6 +107,7 @@ async def initialize_metadata_tables(db):
 
 async def populate_schema_tables(internal_db, db):
     database_name = db.name
+    backend = db.backend
 
     def delete_everything(conn):
         conn.execute(
@@ -129,9 +129,6 @@ async def populate_schema_tables(internal_db, db):
 
     await internal_db.execute_write_fn(delete_everything)
 
-    tables = (await db.execute("select * from sqlite_master WHERE type = 'table'")).rows
-    views = (await db.execute("select * from sqlite_master WHERE type = 'view'")).rows
-
     def collect_info(conn):
         tables_to_insert = []
         views_to_insert = []
@@ -139,18 +136,22 @@ async def populate_schema_tables(internal_db, db):
         foreign_keys_to_insert = []
         indexes_to_insert = []
 
-        for view in views:
-            view_name = view["name"]
+        # Use backend methods for schema introspection
+        table_names = backend.table_names(conn)
+        view_names = backend.view_names(conn)
+
+        for view_name in view_names:
+            view_def = backend.get_view_definition(conn, view_name)
             views_to_insert.append(
-                (database_name, view_name, view["rootpage"], view["sql"])
+                (database_name, view_name, 0, view_def)
             )
 
-        for table in tables:
-            table_name = table["name"]
+        for table_name in table_names:
+            table_def = backend.get_table_definition(conn, table_name)
             tables_to_insert.append(
-                (database_name, table_name, table["rootpage"], table["sql"])
+                (database_name, table_name, 0, table_def)
             )
-            columns = table_column_details(conn, table_name)
+            columns = backend.table_column_details(conn, table_name)
             columns_to_insert.extend(
                 {
                     **{"database_name": database_name, "table_name": table_name},
@@ -158,24 +159,35 @@ async def populate_schema_tables(internal_db, db):
                 }
                 for column in columns
             )
-            foreign_keys = conn.execute(
-                f"PRAGMA foreign_key_list([{table_name}])"
-            ).fetchall()
-            foreign_keys_to_insert.extend(
-                {
-                    **{"database_name": database_name, "table_name": table_name},
-                    **dict(foreign_key),
-                }
-                for foreign_key in foreign_keys
-            )
-            indexes = conn.execute(f"PRAGMA index_list([{table_name}])").fetchall()
-            indexes_to_insert.extend(
-                {
-                    **{"database_name": database_name, "table_name": table_name},
-                    **dict(index),
-                }
-                for index in indexes
-            )
+            fks = backend.foreign_keys_for_table(conn, table_name)
+            for i, fk in enumerate(fks):
+                foreign_keys_to_insert.append(
+                    {
+                        "database_name": database_name,
+                        "table_name": table_name,
+                        "id": i,
+                        "seq": 0,
+                        "table": fk["other_table"],
+                        "from": fk["column"],
+                        "to": fk["other_column"],
+                        "on_update": "NO ACTION",
+                        "on_delete": "NO ACTION",
+                        "match": "NONE",
+                    }
+                )
+            indexes = backend.indexes_for_table(conn, table_name)
+            for i, index in enumerate(indexes):
+                indexes_to_insert.append(
+                    {
+                        "database_name": database_name,
+                        "table_name": table_name,
+                        "seq": index.get("seq", i),
+                        "name": index.get("name", ""),
+                        "unique": index.get("unique", 0),
+                        "origin": index.get("origin", ""),
+                        "partial": index.get("partial", 0),
+                    }
+                )
         return (
             tables_to_insert,
             views_to_insert,

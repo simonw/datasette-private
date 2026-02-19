@@ -1212,6 +1212,68 @@ async def test_hook_filters_from_request(ds_client):
 
 
 @pytest.mark.asyncio
+async def test_hook_register_database_backends():
+    """Test that register_database_backends hook populates the backend registry."""
+    from datasette.backends.base import DatabaseBackend
+
+    class FakeBackend(DatabaseBackend):
+        backend_type = "fake"
+
+        def create_connection(self, write=False):
+            pass
+
+        def prepare_connection(self, conn, datasette, database_name):
+            pass
+
+        async def execute(self, sql, params=None, **kwargs):
+            pass
+
+        async def execute_fn(self, fn):
+            pass
+
+        async def execute_write_fn(self, fn, **kwargs):
+            pass
+
+        def escape_identifier(self, identifier):
+            return identifier
+
+        def table_names(self, conn):
+            return []
+
+        def view_names(self, conn):
+            return []
+
+        def table_columns(self, conn, table):
+            return []
+
+        def table_column_details(self, conn, table):
+            return []
+
+        def primary_keys(self, conn, table):
+            return []
+
+        def foreign_keys_for_table(self, conn, table):
+            return []
+
+        def get_all_foreign_keys(self, conn):
+            return {}
+
+    class BackendPlugin:
+        __name__ = "BackendPlugin"
+
+        @hookimpl
+        def register_database_backends(self, datasette):
+            return [FakeBackend]
+
+    ds = Datasette()
+    ds.pm.register(BackendPlugin(), name="BackendPlugin")
+    await ds.invoke_startup()
+    assert "fake" in ds._backend_registry
+    assert ds._backend_registry["fake"] is FakeBackend
+    ds.pm.unregister(name="BackendPlugin")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("extra_metadata", (False, True))
 async def test_hook_register_actions(extra_metadata):
 
