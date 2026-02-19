@@ -1540,14 +1540,15 @@ class Datasette:
         if not label_column:
             return {(fk["column"], value): str(value) for value in values}
         labeled_fks = {}
+        escape = db.escape_identifier
         sql = """
             select {other_column}, {label_column}
             from {other_table}
             where {other_column} in ({placeholders})
         """.format(
-            other_column=escape_sqlite(other_column),
-            label_column=escape_sqlite(label_column),
-            other_table=escape_sqlite(other_table),
+            other_column=escape(other_column),
+            label_column=escape(label_column),
+            other_table=escape(other_table),
             placeholders=", ".join(["?"] * len(set(values))),
         )
         try:

@@ -26,7 +26,6 @@ from datasette.utils import (
     format_bytes,
     make_slot_function,
     tilde_encode,
-    escape_sqlite,
     filters_should_redirect,
     is_url,
     path_from_row_pks,
@@ -732,7 +731,7 @@ async def _sortable_columns_for_table(datasette, database_name, table_name, use_
     return sortable_columns
 
 
-async def _sort_order(table_metadata, sortable_columns, request, order_by):
+async def _sort_order(table_metadata, sortable_columns, request, order_by, escape_fn):
     sort = request.args.get("_sort")
     sort_desc = request.args.get("_sort_desc")
 
@@ -749,13 +748,13 @@ async def _sort_order(table_metadata, sortable_columns, request, order_by):
         if sort not in sortable_columns:
             raise DatasetteError(f"Cannot sort table by {sort}", status=400)
 
-        order_by = escape_sqlite(sort)
+        order_by = escape_fn(sort)
 
     if sort_desc:
         if sort_desc not in sortable_columns:
             raise DatasetteError(f"Cannot sort table by {sort_desc}", status=400)
 
-        order_by = f"{escape_sqlite(sort_desc)} desc"
+        order_by = f"{escape_fn(sort_desc)} desc"
 
     return sort, sort_desc, order_by
 
@@ -994,8 +993,9 @@ async def table_view_data(
 
     # Take ?_col= and ?_nocol= into account
     specified_columns = await _columns_to_select(table_columns, pks, request)
-    select_specified_columns = ", ".join(escape_sqlite(t) for t in specified_columns)
-    select_all_columns = ", ".join(escape_sqlite(t) for t in table_columns)
+    escape = db.escape_identifier
+    select_specified_columns = ", ".join(escape(t) for t in specified_columns)
+    select_all_columns = ", ".join(escape(t) for t in table_columns)
 
     # rowid tables (no specified primary key) need a different SELECT
     use_rowid = not pks and not is_view
@@ -1006,7 +1006,7 @@ async def table_view_data(
         order_by = "rowid"
         order_by_pks = "rowid"
     else:
-        order_by_pks = ", ".join([escape_sqlite(pk) for pk in pks])
+        order_by_pks = ", ".join([escape(pk) for pk in pks])
         order_by = order_by_pks
 
     if is_view:
@@ -1034,7 +1034,7 @@ async def table_view_data(
 
     # Build where clauses from query string arguments
     filters = Filters(sorted(filter_args))
-    where_clauses, params = filters.build_where_clauses(table_name)
+    where_clauses, params = filters.build_where_clauses(table_name, escape_fn=escape)
 
     # Execute filters_from_request plugin hooks - including the default
     # ones that live in datasette/filters.py
@@ -1060,11 +1060,11 @@ async def table_view_data(
     )
 
     sort, sort_desc, order_by = await _sort_order(
-        table_metadata, sortable_columns, request, order_by
+        table_metadata, sortable_columns, request, order_by, escape_fn=escape
     )
 
     from_sql = "from {table_name} {where}".format(
-        table_name=escape_sqlite(table_name),
+        table_name=escape(table_name),
         where=(
             ("where {} ".format(" and ".join(where_clauses))) if where_clauses else ""
         ),
@@ -1103,7 +1103,7 @@ async def table_view_data(
                 # Apply the tie-breaker based on primary keys
                 if len(components) == len(pks):
                     param_len = len(params)
-                    next_by_pk_clauses.append(compound_keys_after_sql(pks, param_len))
+                    next_by_pk_clauses.append(compound_keys_after_sql(pks, param_len, escape_fn=escape))
                     for i, pk_value in enumerate(components):
                         params[f"p{param_len + i}"] = pk_value
 
@@ -1114,28 +1114,28 @@ async def table_view_data(
                         # Just items where column is null ordered by pk
                         where_clauses.append(
                             "({column} is null and {next_clauses})".format(
-                                column=escape_sqlite(sort_desc),
+                                column=escape(sort_desc),
                                 next_clauses=" and ".join(next_by_pk_clauses),
                             )
                         )
                     else:
                         where_clauses.append(
                             "({column} is not null or ({column} is null and {next_clauses}))".format(
-                                column=escape_sqlite(sort),
+                                column=escape(sort),
                                 next_clauses=" and ".join(next_by_pk_clauses),
                             )
                         )
                 else:
                     where_clauses.append(
                         "({column} {op} :p{p}{extra_desc_only} or ({column} = :p{p} and {next_clauses}))".format(
-                            column=escape_sqlite(sort or sort_desc),
+                            column=escape(sort or sort_desc),
                             op=">" if sort else "<",
                             p=len(params),
                             extra_desc_only=(
                                 ""
                                 if sort
                                 else " or {column2} is null".format(
-                                    column2=escape_sqlite(sort or sort_desc)
+                                    column2=escape(sort or sort_desc)
                                 )
                             ),
                             next_clauses=" and ".join(next_by_pk_clauses),
@@ -1180,7 +1180,7 @@ async def table_view_data(
     sql_no_order_no_limit = (
         "select {select_all_columns} from {table_name} {where}".format(
             select_all_columns=select_all_columns,
-            table_name=escape_sqlite(table_name),
+            table_name=escape(table_name),
             where=where_clause,
         )
     )
@@ -1188,7 +1188,7 @@ async def table_view_data(
     # This is the SQL that populates the main table on the page
     sql = "select {select_specified_columns} from {table_name} {where}{order_by} limit {page_size}{offset}".format(
         select_specified_columns=select_specified_columns,
-        table_name=escape_sqlite(table_name),
+        table_name=escape(table_name),
         where=where_clause,
         order_by=order_by,
         page_size=page_size + 1,
@@ -1330,7 +1330,12 @@ async def table_view_data(
         facet_classes = list(
             itertools.chain.from_iterable(pm.hook.register_facet_classes())
         )
+        backend_type = db.backend.backend_type
         for facet_class in facet_classes:
+            # Skip facets that don't support this backend
+            allowed_backends = getattr(facet_class, "backend_types", None)
+            if allowed_backends is not None and backend_type not in allowed_backends:
+                continue
             facet_instances.append(
                 facet_class(
                     datasette,

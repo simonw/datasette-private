@@ -192,7 +192,7 @@ def path_from_row_pks(row, pks, use_rowid, quote=True):
     return ",".join(bits)
 
 
-def compound_keys_after_sql(pks, start_index=0):
+def compound_keys_after_sql(pks, start_index=0, escape_fn=None):
     # Implementation of keyset pagination
     # See https://github.com/simonw/datasette/issues/190
     # For pk1/pk2/pk3 returns:
@@ -202,6 +202,8 @@ def compound_keys_after_sql(pks, start_index=0):
     # ([pk1] = :p0 and [pk2] > :p1)
     #   or
     # ([pk1] = :p0 and [pk2] = :p1 and [pk3] > :p2)
+    if escape_fn is None:
+        escape_fn = escape_sqlite
     or_clauses = []
     pks_left = pks[:]
     while pks_left:
@@ -209,9 +211,9 @@ def compound_keys_after_sql(pks, start_index=0):
         last = pks_left[-1]
         rest = pks_left[:-1]
         and_clauses = [
-            f"{escape_sqlite(pk)} = :p{i + start_index}" for i, pk in enumerate(rest)
+            f"{escape_fn(pk)} = :p{i + start_index}" for i, pk in enumerate(rest)
         ]
-        and_clauses.append(f"{escape_sqlite(last)} > :p{len(rest) + start_index}")
+        and_clauses.append(f"{escape_fn(last)} > :p{len(rest) + start_index}")
         or_clauses.append(f"({' and '.join(and_clauses)})")
         pks_left.pop()
     or_clauses.reverse()

@@ -7,7 +7,6 @@ from datasette.utils import (
     await_me_maybe,
     make_slot_function,
     to_css_class,
-    escape_sqlite,
 )
 from datasette.plugins import pm
 import json
@@ -162,11 +161,12 @@ class RowView(DataView):
         if len(foreign_keys) == 0:
             return []
 
+        escape = db.escape_identifier
         sql = "select " + ", ".join(
             [
                 "(select count(*) from {table} where {column}=:id)".format(
-                    table=escape_sqlite(fk["other_table"]),
-                    column=escape_sqlite(fk["other_column"]),
+                    table=escape(fk["other_table"]),
+                    column=escape(fk["other_column"]),
                 )
                 for fk in foreign_keys
             ]
