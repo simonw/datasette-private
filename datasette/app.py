@@ -636,9 +636,9 @@ class Datasette:
             if hasattr(db.backend, "async_schema_version"):
                 schema_version = await db.backend.async_schema_version()
             else:
-                schema_version = await db.execute_fn(
-                    lambda conn: db.backend.schema_version(conn)
-                )
+                schema_version = (
+                    await db.execute("PRAGMA schema_version")
+                ).first()[0]
             # Compare schema versions to see if we should skip it
             if schema_version == current_schema_versions.get(database_name):
                 continue

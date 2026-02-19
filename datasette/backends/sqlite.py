@@ -248,19 +248,15 @@ class SQLiteBackend(DatabaseBackend):
         def _inner(conn):
             return conn.execute(sql, params or [])
 
-        with trace("sql", database=getattr(self, "_database_name", ""), sql=sql.strip(), params=params):
-            results = await self.execute_write_fn(_inner, block=block, request=request)
-        return results
+        return await self.execute_write_fn(_inner, block=block, request=request)
 
     async def execute_write_script(self, sql, block=True, request=None):
         def _inner(conn):
             return conn.executescript(sql)
 
-        with trace("sql", database=getattr(self, "_database_name", ""), sql=sql.strip(), executescript=True):
-            results = await self.execute_write_fn(
-                _inner, block=block, transaction=False, request=request
-            )
-        return results
+        return await self.execute_write_fn(
+            _inner, block=block, transaction=False, request=request
+        )
 
     async def execute_write_many(self, sql, params_seq, block=True, request=None):
         def _inner(conn):
@@ -274,14 +270,10 @@ class SQLiteBackend(DatabaseBackend):
 
             return conn.executemany(sql, count_params(params_seq)), count
 
-        with trace(
-            "sql", database=getattr(self, "_database_name", ""), sql=sql.strip(), executemany=True
-        ) as kwargs:
-            results, count = await self.execute_write_fn(
-                _inner, block=block, request=request
-            )
-            kwargs["count"] = count
-        return results
+        results, count = await self.execute_write_fn(
+            _inner, block=block, request=request
+        )
+        return results, count
 
     async def execute_write_fn(self, fn, block=True, transaction=True, request=None):
         fn = self._wrap_fn_with_hooks(fn, request, transaction)
