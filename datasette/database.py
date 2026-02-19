@@ -165,38 +165,63 @@ class Database:
     def escape_identifier(self, identifier):
         return self.backend.escape_identifier(identifier)
 
-    # ---- Schema introspection (delegated to backend via execute_fn) ----
+    # ---- Schema introspection ----
+    # Backends that provide async_* methods (e.g. PostgreSQL) use those directly.
+    # Otherwise falls back to execute_fn with sync callbacks (e.g. SQLite).
+
+    def _has_async(self, method):
+        return hasattr(self.backend, f"async_{method}")
 
     async def table_names(self):
+        if self._has_async("table_names"):
+            return await self.backend.async_table_names()
         return await self.execute_fn(lambda conn: self.backend.table_names(conn))
 
     async def view_names(self):
+        if self._has_async("view_names"):
+            return await self.backend.async_view_names()
         return await self.execute_fn(lambda conn: self.backend.view_names(conn))
 
     async def table_exists(self, table):
+        if self._has_async("table_exists"):
+            return await self.backend.async_table_exists(table)
         return await self.execute_fn(lambda conn: self.backend.table_exists(conn, table))
 
     async def view_exists(self, table):
+        if self._has_async("view_exists"):
+            return await self.backend.async_view_exists(table)
         return await self.execute_fn(lambda conn: self.backend.view_exists(conn, table))
 
     async def table_columns(self, table):
+        if self._has_async("table_columns"):
+            return await self.backend.async_table_columns(table)
         return await self.execute_fn(lambda conn: self.backend.table_columns(conn, table))
 
     async def table_column_details(self, table):
+        if self._has_async("table_column_details"):
+            return await self.backend.async_table_column_details(table)
         return await self.execute_fn(lambda conn: self.backend.table_column_details(conn, table))
 
     async def primary_keys(self, table):
+        if self._has_async("primary_keys"):
+            return await self.backend.async_primary_keys(table)
         return await self.execute_fn(lambda conn: self.backend.primary_keys(conn, table))
 
     async def fts_table(self, table):
+        if self._has_async("detect_fts"):
+            return await self.backend.async_detect_fts(table)
         return await self.execute_fn(lambda conn: self.backend.detect_fts(conn, table))
 
     async def foreign_keys_for_table(self, table):
+        if self._has_async("foreign_keys_for_table"):
+            return await self.backend.async_foreign_keys_for_table(table)
         return await self.execute_fn(
             lambda conn: self.backend.foreign_keys_for_table(conn, table)
         )
 
     async def get_all_foreign_keys(self):
+        if self._has_async("get_all_foreign_keys"):
+            return await self.backend.async_get_all_foreign_keys()
         return await self.execute_fn(lambda conn: self.backend.get_all_foreign_keys(conn))
 
     async def hidden_table_names(self):
@@ -210,12 +235,17 @@ class Database:
                 if db_config["tables"][t].get("hidden")
             ]
         # Get backend-specific hidden tables
-        hidden_tables += await self.execute_fn(
-            lambda conn: self.backend.hidden_table_names(conn)
-        )
+        if self._has_async("hidden_table_names"):
+            hidden_tables += await self.backend.async_hidden_table_names()
+        else:
+            hidden_tables += await self.execute_fn(
+                lambda conn: self.backend.hidden_table_names(conn)
+            )
         return hidden_tables
 
     async def get_table_definition(self, table, type_="table"):
+        if self._has_async("get_table_definition"):
+            return await self.backend.async_get_table_definition(table, type_)
         return await self.execute_fn(
             lambda conn: self.backend.get_table_definition(conn, table)
             if type_ == "table"
@@ -223,6 +253,8 @@ class Database:
         )
 
     async def get_view_definition(self, view):
+        if self._has_async("get_view_definition"):
+            return await self.backend.async_get_view_definition(view)
         return await self.execute_fn(
             lambda conn: self.backend.get_view_definition(conn, view)
         )
@@ -234,10 +266,12 @@ class Database:
         if explicit_label_column:
             return explicit_label_column
 
-        def column_details(conn):
-            return self.backend.label_column_details(conn, table)
-
-        column_details = await self.execute_fn(column_details)
+        if self._has_async("label_column_details"):
+            column_details = await self.backend.async_label_column_details(table)
+        else:
+            column_details = await self.execute_fn(
+                lambda conn: self.backend.label_column_details(conn, table)
+            )
         unique_text_columns = [
             name
             for name, (type_, is_unique) in column_details.items()
