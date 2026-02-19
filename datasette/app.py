@@ -633,9 +633,12 @@ class Datasette:
                 [stale_db_name],
             )
         for database_name, db in self.databases.items():
-            schema_version = await db.execute_fn(
-                lambda conn: db.backend.schema_version(conn)
-            )
+            if hasattr(db.backend, "async_schema_version"):
+                schema_version = await db.backend.async_schema_version()
+            else:
+                schema_version = await db.execute_fn(
+                    lambda conn: db.backend.schema_version(conn)
+                )
             # Compare schema versions to see if we should skip it
             if schema_version == current_schema_versions.get(database_name):
                 continue
@@ -1540,6 +1543,9 @@ class Datasette:
         if not label_column:
             return {(fk["column"], value): str(value) for value in values}
         labeled_fks = {}
+        unique_values = [v for v in set(values) if v is not None]
+        if not unique_values:
+            return labeled_fks
         escape = db.escape_identifier
         sql = """
             select {other_column}, {label_column}
@@ -1549,10 +1555,10 @@ class Datasette:
             other_column=escape(other_column),
             label_column=escape(label_column),
             other_table=escape(other_table),
-            placeholders=", ".join(["?"] * len(set(values))),
+            placeholders=", ".join(["?"] * len(unique_values)),
         )
         try:
-            results = await self.execute(database, sql, list(set(values)))
+            results = await self.execute(database, sql, unique_values)
         except QueryInterrupted:
             pass
         else:
