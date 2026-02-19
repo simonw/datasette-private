@@ -533,6 +533,7 @@ def pg_backend(pg_test_schema):
     backend = PostgresBackend(
         connection_string=POSTGRESQL_TEST_URL,
         schema=pg_test_schema,
+        statement_timeout_ms=5000,
     )
     yield backend
 
