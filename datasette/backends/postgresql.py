@@ -1,6 +1,6 @@
 """PostgreSQL database backend for Datasette.
 
-Uses psycopg v3 in synchronous mode within Datasette's thread pool.
+Uses psycopg v3 async support for non-blocking database operations.
 Key differences from SQLite:
 - No write queue needed (PostgreSQL uses MVCC for concurrent writes)
 - Read connections use default_transaction_read_only=on
@@ -13,7 +13,7 @@ import asyncio
 import re
 import sys
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import psycopg
@@ -107,47 +107,76 @@ class PostgresBackend(DatabaseBackend):
         self.schema = schema
         self.statement_timeout_ms = statement_timeout_ms
 
-        # Connection tracking
-        self._all_connections = []
-
     # ---- Connection lifecycle ----
 
-    def create_connection(self, write=False):
+    def _connection_options(self, write=False):
         options_parts = []
         if not write:
             options_parts.append("-c default_transaction_read_only=on")
         options_parts.append(f"-c statement_timeout={self.statement_timeout_ms}")
         if self.schema:
             options_parts.append(f"-c search_path={self.schema}")
-        options = " ".join(options_parts)
+        return " ".join(options_parts)
 
-        conn = psycopg.connect(
+    async def _get_read_conn(self):
+        """Get or create a persistent async read connection."""
+        if (
+            not hasattr(self, "_read_conn")
+            or self._read_conn is None
+            or self._read_conn.closed
+        ):
+            self._read_conn = await psycopg.AsyncConnection.connect(
+                self.connection_string,
+                options=self._connection_options(write=False),
+                autocommit=True,
+                row_factory=PostgresRow.row_factory,
+            )
+        return self._read_conn
+
+    @asynccontextmanager
+    async def _async_conn(self, write=False):
+        if not write:
+            yield await self._get_read_conn()
+        else:
+            conn = await psycopg.AsyncConnection.connect(
+                self.connection_string,
+                options=self._connection_options(write=True),
+                autocommit=True,
+                row_factory=PostgresRow.row_factory,
+            )
+            try:
+                yield conn
+            finally:
+                await conn.close()
+
+    def _sync_conn(self, write=False):
+        return psycopg.connect(
             self.connection_string,
-            options=options,
+            options=self._connection_options(write),
             autocommit=True,
             row_factory=PostgresRow.row_factory,
         )
-        self._all_connections.append(conn)
-        return conn
+
+    def create_connection(self, write=False):
+        return self._sync_conn(write)
 
     def close_connection(self, conn):
         conn.close()
-        try:
-            self._all_connections.remove(conn)
-        except ValueError:
-            pass
 
     def close_all(self):
-        for conn in self._all_connections:
+        if hasattr(self, "_read_conn") and self._read_conn and not self._read_conn.closed:
+            # Schedule async close if event loop is running
             try:
-                conn.close()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._read_conn.close())
+                else:
+                    loop.run_until_complete(self._read_conn.close())
             except Exception:
                 pass
-        self._all_connections.clear()
+            self._read_conn = None
 
     def prepare_connection(self, conn, datasette, database_name):
-        # PostgreSQL connections are configured at creation time via options
-        # No additional preparation needed
         pass
 
     # ---- Async execution ----
@@ -164,52 +193,16 @@ class PostgresBackend(DatabaseBackend):
         page_size = page_size or (self.ds.page_size if self.ds else 50)
         translated_sql = self.translate_sql(sql)
 
-        def sql_operation_in_thread(conn):
-            time_limit_ms = self.ds.sql_time_limit_ms if self.ds else self.statement_timeout_ms
-            if custom_time_limit and custom_time_limit < time_limit_ms:
-                time_limit_ms = custom_time_limit
+        if isinstance(params, (list, tuple)):
+            pg_params = tuple(params)
+        elif params is not None:
+            pg_params = params
+        else:
+            pg_params = {}
 
-            with self.time_limit_context(conn, time_limit_ms):
-                try:
-                    if isinstance(params, (list, tuple)):
-                        pg_params = tuple(params)
-                    elif params is not None:
-                        pg_params = params
-                    else:
-                        pg_params = {}
-                    cursor = conn.execute(translated_sql, pg_params)
-                    max_returned_rows = (
-                        self.ds.max_returned_rows if self.ds else 100
-                    )
-                    if max_returned_rows == page_size:
-                        max_returned_rows += 1
-                    if max_returned_rows and truncate:
-                        rows = cursor.fetchmany(max_returned_rows + 1)
-                        truncated = len(rows) > max_returned_rows
-                        rows = rows[:max_returned_rows]
-                    else:
-                        rows = cursor.fetchall()
-                        truncated = False
-                except psycopg.errors.QueryCanceled as e:
-                    from ..database import QueryInterrupted
-
-                    raise QueryInterrupted(e, sql, params)
-                except (psycopg.errors.OperationalError, psycopg.errors.DatabaseError) as e:
-                    if log_sql_errors:
-                        sys.stderr.write(
-                            "ERROR: conn={}, sql = {}, params = {}: {}\n".format(
-                                conn, repr(sql), params, e
-                            )
-                        )
-                        sys.stderr.flush()
-                    raise
-
-            from ..database import Results
-
-            if truncate:
-                return Results(rows, truncated, cursor.description)
-            else:
-                return Results(rows, False, cursor.description)
+        time_limit_ms = self.ds.sql_time_limit_ms if self.ds else self.statement_timeout_ms
+        if custom_time_limit and custom_time_limit < time_limit_ms:
+            time_limit_ms = custom_time_limit
 
         with trace(
             "sql",
@@ -217,30 +210,57 @@ class PostgresBackend(DatabaseBackend):
             sql=sql.strip(),
             params=params,
         ):
-            results = await self.execute_fn(sql_operation_in_thread)
-        return results
+            async with self._async_conn() as conn:
+                async with self._async_time_limit(conn, time_limit_ms):
+                    try:
+                        cursor = await conn.execute(translated_sql, pg_params)
+                        max_returned_rows = (
+                            self.ds.max_returned_rows if self.ds else 100
+                        )
+                        if max_returned_rows == page_size:
+                            max_returned_rows += 1
+                        if max_returned_rows and truncate:
+                            rows = await cursor.fetchmany(max_returned_rows + 1)
+                            truncated = len(rows) > max_returned_rows
+                            rows = rows[:max_returned_rows]
+                        else:
+                            rows = await cursor.fetchall()
+                            truncated = False
+                    except psycopg.errors.QueryCanceled as e:
+                        from ..database import QueryInterrupted
+
+                        raise QueryInterrupted(e, sql, params)
+                    except (psycopg.errors.OperationalError, psycopg.errors.DatabaseError) as e:
+                        if log_sql_errors:
+                            sys.stderr.write(
+                                "ERROR: conn={}, sql = {}, params = {}: {}\n".format(
+                                    conn, repr(sql), params, e
+                                )
+                            )
+                            sys.stderr.flush()
+                        raise
+
+        from ..database import Results
+
+        if truncate:
+            return Results(rows, truncated, cursor.description)
+        else:
+            return Results(rows, False, cursor.description)
 
     async def execute_fn(self, fn):
-        if self.ds is None or self.ds.executor is None:
-            # non-threaded mode
-            conn = self.create_connection()
-            try:
-                return fn(conn)
-            finally:
-                self.close_connection(conn)
+        """Run fn(conn) using an async connection.
 
-        # threaded mode - use a fresh connection per call
-        # (psycopg connections are not thread-safe)
-        def in_thread():
-            conn = self.create_connection()
-            try:
-                return fn(conn)
-            finally:
-                self.close_connection(conn)
+        For schema introspection callbacks that do sync conn.execute() calls,
+        we use asyncio.to_thread with a sync connection.
+        """
+        return await asyncio.to_thread(self._run_fn_sync, fn)
 
-        return await asyncio.get_event_loop().run_in_executor(
-            self.ds.executor, in_thread
-        )
+    def _run_fn_sync(self, fn, write=False):
+        conn = self._sync_conn(write)
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
 
     async def execute_write_fn(
         self, fn, block=True, transaction=True, request=None
@@ -251,33 +271,13 @@ class PostgresBackend(DatabaseBackend):
         """
         fn = self._wrap_fn_with_hooks(fn, request, transaction)
 
-        if self.ds is None or self.ds.executor is None:
-            # non-threaded mode
-            conn = self.create_connection(write=True)
-            try:
-                if transaction:
-                    with conn.transaction():
-                        return fn(conn)
-                else:
+        if transaction:
+            def fn_with_txn(conn):
+                with conn.transaction():
                     return fn(conn)
-            finally:
-                self.close_connection(conn)
-
-        # threaded mode
-        def in_thread():
-            conn = self.create_connection(write=True)
-            try:
-                if transaction:
-                    with conn.transaction():
-                        return fn(conn)
-                else:
-                    return fn(conn)
-            finally:
-                self.close_connection(conn)
-
-        return await asyncio.get_event_loop().run_in_executor(
-            self.ds.executor, in_thread
-        )
+            return await asyncio.to_thread(self._run_fn_sync, fn_with_txn, True)
+        else:
+            return await asyncio.to_thread(self._run_fn_sync, fn, True)
 
     async def execute_write(self, sql, params=None, block=True, request=None):
         translated_sql = self.translate_sql(sql)
@@ -300,7 +300,6 @@ class PostgresBackend(DatabaseBackend):
         """Execute multiple statements separated by semicolons."""
 
         def _inner(conn):
-            # psycopg can execute multiple statements
             return conn.execute(sql)
 
         with trace(
@@ -339,23 +338,7 @@ class PostgresBackend(DatabaseBackend):
 
     async def execute_isolated_fn(self, fn):
         """Execute fn on a dedicated connection."""
-        if self.ds is None or self.ds.executor is None:
-            conn = self.create_connection(write=True)
-            try:
-                return fn(conn)
-            finally:
-                self.close_connection(conn)
-
-        def in_thread():
-            conn = self.create_connection(write=True)
-            try:
-                return fn(conn)
-            finally:
-                self.close_connection(conn)
-
-        return await asyncio.get_event_loop().run_in_executor(
-            self.ds.executor, in_thread
-        )
+        return await asyncio.to_thread(self._run_fn_sync, fn, True)
 
     def _wrap_fn_with_hooks(self, fn, request, transaction):
         if self.ds is None:
@@ -399,16 +382,28 @@ class PostgresBackend(DatabaseBackend):
 
     # ---- Time limiting ----
 
-    @contextmanager
-    def time_limit_context(self, conn, ms):
-        """Set per-query statement_timeout using SET LOCAL."""
-        # For PostgreSQL, we need a transaction for SET LOCAL
-        # Since we use autocommit, we use a subtransaction
+    @asynccontextmanager
+    async def _async_time_limit(self, conn, ms):
+        """Set per-query statement_timeout using async connection."""
         try:
-            conn.execute(f"SET statement_timeout = {int(ms)}")
+            await conn.execute(f"SET statement_timeout = {int(ms)}")
             yield
         finally:
-            conn.execute(f"SET statement_timeout = {self.statement_timeout_ms}")
+            await conn.execute(f"SET statement_timeout = {self.statement_timeout_ms}")
+
+    def time_limit_context(self, conn, ms):
+        """Sync time limit context - only used by execute_fn callbacks."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def ctx():
+            try:
+                conn.execute(f"SET statement_timeout = {int(ms)}")
+                yield
+            finally:
+                conn.execute(f"SET statement_timeout = {self.statement_timeout_ms}")
+
+        return ctx()
 
     def is_interrupted_error(self, error):
         return isinstance(error, psycopg.errors.QueryCanceled)
@@ -710,6 +705,287 @@ class PostgresBackend(DatabaseBackend):
         ).fetchone()
         if row and row[0]:
             # Convert first 8 hex chars to int for a comparable version number
+            return int(row[0][:8], 16)
+        return 0
+
+    # ---- Async schema introspection ----
+    # These bypass execute_fn/threads and use async connections directly.
+
+    async def _async_fetch(self, sql, params=None):
+        async with self._async_conn() as conn:
+            cursor = await conn.execute(sql, params or {})
+            return await cursor.fetchall()
+
+    async def async_table_names(self):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %(schema)s
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            """,
+            {"schema": schema},
+        )
+        return [r[0] for r in rows]
+
+    async def async_view_names(self):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT table_name
+            FROM information_schema.views
+            WHERE table_schema = %(schema)s
+            ORDER BY table_name
+            """,
+            {"schema": schema},
+        )
+        return [r[0] for r in rows]
+
+    async def async_table_exists(self, table):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %(schema)s
+              AND table_name = %(table)s
+              AND table_type = 'BASE TABLE'
+            """,
+            {"schema": schema, "table": table},
+        )
+        return bool(rows)
+
+    async def async_view_exists(self, view):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT 1
+            FROM information_schema.views
+            WHERE table_schema = %(schema)s
+              AND table_name = %(view)s
+            """,
+            {"schema": schema, "view": view},
+        )
+        return bool(rows)
+
+    async def async_table_column_details(self, table):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT
+                c.ordinal_position - 1 AS cid,
+                c.column_name AS name,
+                c.data_type AS type,
+                CASE WHEN c.is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+                c.column_default AS default_value,
+                CASE WHEN pk.column_name IS NOT NULL THEN pk.ordinal_position ELSE 0 END AS is_pk,
+                0 AS hidden
+            FROM information_schema.columns c
+            LEFT JOIN (
+                SELECT kcu.column_name, kcu.ordinal_position
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema = %(schema)s
+                  AND tc.table_name = %(table)s
+                  AND tc.constraint_type = 'PRIMARY KEY'
+            ) pk ON c.column_name = pk.column_name
+            WHERE c.table_schema = %(schema)s
+              AND c.table_name = %(table)s
+            ORDER BY c.ordinal_position
+            """,
+            {"schema": schema, "table": table},
+        )
+        return [Column(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows]
+
+    async def async_table_columns(self, table):
+        return [col.name for col in await self.async_table_column_details(table)]
+
+    async def async_primary_keys(self, table):
+        columns = await self.async_table_column_details(table)
+        pks = [col for col in columns if col.is_pk]
+        pks.sort(key=lambda col: col.is_pk)
+        return [col.name for col in pks]
+
+    async def async_detect_fts(self, table):
+        return None
+
+    async def async_foreign_keys_for_table(self, table):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT
+                kcu.column_name AS from_column,
+                ccu.table_name AS to_table,
+                ccu.column_name AS to_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON tc.constraint_name = ccu.constraint_name
+              AND tc.table_schema = ccu.table_schema
+            WHERE tc.table_schema = %(schema)s
+              AND tc.table_name = %(table)s
+              AND tc.constraint_type = 'FOREIGN KEY'
+            ORDER BY kcu.ordinal_position
+            """,
+            {"schema": schema, "table": table},
+        )
+        return [
+            {"column": r[0], "other_table": r[1], "other_column": r[2]}
+            for r in rows
+        ]
+
+    async def async_get_all_foreign_keys(self):
+        tables = await self.async_table_names()
+        table_to_foreign_keys = {}
+        for table in tables:
+            table_to_foreign_keys[table] = {"incoming": [], "outgoing": []}
+        for table in tables:
+            fks = await self.async_foreign_keys_for_table(table)
+            for fk in fks:
+                table_name = fk["other_table"]
+                from_ = fk["column"]
+                to_ = fk["other_column"]
+                if table_name not in table_to_foreign_keys:
+                    continue
+                table_to_foreign_keys[table_name]["incoming"].append(
+                    {"other_table": table, "column": to_, "other_column": from_}
+                )
+                table_to_foreign_keys[table]["outgoing"].append(
+                    {"other_table": table_name, "column": from_, "other_column": to_}
+                )
+        for table in table_to_foreign_keys:
+            table_to_foreign_keys[table]["incoming"].sort(
+                key=lambda fk: (fk["other_table"], fk["column"], fk["other_column"])
+            )
+            table_to_foreign_keys[table]["outgoing"].sort(
+                key=lambda fk: (fk["other_table"], fk["column"], fk["other_column"])
+            )
+        return table_to_foreign_keys
+
+    async def async_hidden_table_names(self):
+        return []
+
+    async def async_get_table_definition(self, table, type_="table"):
+        if type_ == "view":
+            return await self.async_get_view_definition(table)
+        columns = await self.async_table_column_details(table)
+        if not columns:
+            return None
+        pk_cols = [c.name for c in columns if c.is_pk]
+        col_defs = []
+        for col in columns:
+            parts = [self.escape_identifier(col.name), col.type]
+            if col.notnull:
+                parts.append("NOT NULL")
+            if col.default_value is not None:
+                parts.append(f"DEFAULT {col.default_value}")
+            col_defs.append(" ".join(parts))
+        if pk_cols:
+            pk_str = ", ".join(self.escape_identifier(c) for c in pk_cols)
+            col_defs.append(f"PRIMARY KEY ({pk_str})")
+        return "CREATE TABLE {} (\n  {}\n);".format(
+            self.escape_identifier(table), ",\n  ".join(col_defs),
+        )
+
+    async def async_get_view_definition(self, view):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT view_definition
+            FROM information_schema.views
+            WHERE table_schema = %(schema)s
+              AND table_name = %(view)s
+            """,
+            {"schema": schema, "view": view},
+        )
+        if not rows:
+            return None
+        return "CREATE VIEW {} AS\n{}".format(
+            self.escape_identifier(view), rows[0][0]
+        )
+
+    async def async_indexes_for_table(self, table):
+        schema = self.schema or "public"
+        rows = await self._async_fetch(
+            """
+            SELECT
+                i.relname AS name,
+                ix.indisunique AS unique,
+                pg_get_indexdef(ix.indexrelid) AS sql
+            FROM pg_index ix
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = %(schema)s
+              AND t.relname = %(table)s
+            ORDER BY i.relname
+            """,
+            {"schema": schema, "table": table},
+        )
+        return [{"name": r[0], "unique": r[1], "sql": r[2]} for r in rows]
+
+    async def async_label_column_details(self, table):
+        schema = self.schema or "public"
+        col_rows = await self._async_fetch(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %(schema)s
+              AND table_name = %(table)s
+            ORDER BY ordinal_position
+            """,
+            {"schema": schema, "table": table},
+        )
+        unique_cols = set()
+        idx_rows = await self._async_fetch(
+            """
+            SELECT a.attname
+            FROM pg_index ix
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+            WHERE n.nspname = %(schema)s
+              AND t.relname = %(table)s
+              AND ix.indisunique = true
+              AND ix.indnatts = 1
+            """,
+            {"schema": schema, "table": table},
+        )
+        for r in idx_rows:
+            unique_cols.add(r[0])
+        _text_types = {
+            "text", "character varying", "varchar", "char", "character",
+            "name", "citext",
+        }
+        details = {}
+        for col_name, data_type in col_rows:
+            py_type = str if data_type in _text_types else type(None)
+            details[col_name] = (py_type, col_name in unique_cols)
+        return details
+
+    async def async_schema_version(self):
+        schema = self.schema or "public"
+        async with self._async_conn() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT md5(string_agg(
+                    table_name || '.' || column_name || '.' || data_type,
+                    ',' ORDER BY table_name, ordinal_position
+                )) AS hash
+                FROM information_schema.columns
+                WHERE table_schema = %(schema)s
+                """,
+                {"schema": schema},
+            )
+            row = await cursor.fetchone()
+        if row and row[0]:
             return int(row[0][:8], 16)
         return 0
 
