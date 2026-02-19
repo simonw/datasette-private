@@ -839,3 +839,310 @@ class TestPostgresBackendAsync:
         db = pg_ds_db
         pks = await db.primary_keys("simple_primary_key")
         assert pks == ["id"]
+
+
+@requires_postgresql
+class TestPostgresBackendAsyncMethods:
+    """Test all 16 async_* methods on PostgresBackend directly.
+
+    Each test calls the async method and verifies it returns the same
+    result as the corresponding sync method using a sync connection.
+    """
+
+    @pytest.fixture
+    def pg_sync_conn(self, pg_backend):
+        """Provide a sync connection from the backend, closed after the test."""
+        conn = pg_backend.create_connection()
+        yield conn
+        pg_backend.close_connection(conn)
+
+    # -- async_table_names --
+
+    @pytest.mark.asyncio
+    async def test_async_table_names(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_names()
+        sync_result = pg_backend.table_names(pg_sync_conn)
+        assert async_result == sync_result
+        assert "simple_primary_key" in async_result
+        assert "compound_pk" in async_result
+        assert "with_foreign_key" in async_result
+        # Views should NOT appear
+        assert "my_view" not in async_result
+
+    # -- async_view_names --
+
+    @pytest.mark.asyncio
+    async def test_async_view_names(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_view_names()
+        sync_result = pg_backend.view_names(pg_sync_conn)
+        assert async_result == sync_result
+        assert "my_view" in async_result
+        assert "simple_primary_key" not in async_result
+
+    # -- async_table_exists --
+
+    @pytest.mark.asyncio
+    async def test_async_table_exists_true(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_exists("simple_primary_key")
+        sync_result = pg_backend.table_exists(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result is True
+
+    @pytest.mark.asyncio
+    async def test_async_table_exists_false(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_exists("nonexistent")
+        sync_result = pg_backend.table_exists(pg_sync_conn, "nonexistent")
+        assert async_result == sync_result
+        assert async_result is False
+
+    # -- async_view_exists --
+
+    @pytest.mark.asyncio
+    async def test_async_view_exists_true(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_view_exists("my_view")
+        sync_result = pg_backend.view_exists(pg_sync_conn, "my_view")
+        assert async_result == sync_result
+        assert async_result is True
+
+    @pytest.mark.asyncio
+    async def test_async_view_exists_false(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_view_exists("nonexistent")
+        sync_result = pg_backend.view_exists(pg_sync_conn, "nonexistent")
+        assert async_result == sync_result
+        assert async_result is False
+
+    # -- async_table_column_details --
+
+    @pytest.mark.asyncio
+    async def test_async_table_column_details(self, pg_backend, pg_sync_conn):
+        from datasette.backends.base import Column
+
+        async_result = await pg_backend.async_table_column_details("simple_primary_key")
+        sync_result = pg_backend.table_column_details(pg_sync_conn, "simple_primary_key")
+        assert len(async_result) == len(sync_result)
+        for async_col, sync_col in zip(async_result, sync_result):
+            assert isinstance(async_col, Column)
+            assert async_col == sync_col
+        # Verify specific column properties
+        assert async_result[0].name == "id"
+        assert async_result[0].is_pk == 1
+        assert async_result[1].name == "content"
+        assert async_result[1].is_pk == 0
+
+    @pytest.mark.asyncio
+    async def test_async_table_column_details_compound_pk(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_column_details("compound_pk")
+        sync_result = pg_backend.table_column_details(pg_sync_conn, "compound_pk")
+        assert len(async_result) == len(sync_result)
+        for async_col, sync_col in zip(async_result, sync_result):
+            assert async_col == sync_col
+
+    # -- async_table_columns --
+
+    @pytest.mark.asyncio
+    async def test_async_table_columns(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_columns("simple_primary_key")
+        sync_result = pg_backend.table_columns(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result == ["id", "content"]
+
+    @pytest.mark.asyncio
+    async def test_async_table_columns_compound(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_table_columns("compound_pk")
+        sync_result = pg_backend.table_columns(pg_sync_conn, "compound_pk")
+        assert async_result == sync_result
+        assert async_result == ["pk1", "pk2", "value"]
+
+    # -- async_primary_keys --
+
+    @pytest.mark.asyncio
+    async def test_async_primary_keys_single(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_primary_keys("simple_primary_key")
+        sync_result = pg_backend.primary_keys(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result == ["id"]
+
+    @pytest.mark.asyncio
+    async def test_async_primary_keys_compound(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_primary_keys("compound_pk")
+        sync_result = pg_backend.primary_keys(pg_sync_conn, "compound_pk")
+        assert async_result == sync_result
+        assert async_result == ["pk1", "pk2"]
+
+    # -- async_detect_fts --
+
+    @pytest.mark.asyncio
+    async def test_async_detect_fts(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_detect_fts("simple_primary_key")
+        sync_result = pg_backend.detect_fts(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result is None
+
+    # -- async_foreign_keys_for_table --
+
+    @pytest.mark.asyncio
+    async def test_async_foreign_keys_for_table(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_foreign_keys_for_table("with_foreign_key")
+        sync_result = pg_backend.foreign_keys_for_table(pg_sync_conn, "with_foreign_key")
+        assert async_result == sync_result
+        assert len(async_result) == 1
+        assert async_result[0]["column"] == "fk_col"
+        assert async_result[0]["other_table"] == "simple_primary_key"
+        assert async_result[0]["other_column"] == "id"
+
+    @pytest.mark.asyncio
+    async def test_async_foreign_keys_for_table_none(self, pg_backend, pg_sync_conn):
+        """Table with no foreign keys should return empty list."""
+        async_result = await pg_backend.async_foreign_keys_for_table("simple_primary_key")
+        sync_result = pg_backend.foreign_keys_for_table(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result == []
+
+    # -- async_get_all_foreign_keys --
+
+    @pytest.mark.asyncio
+    async def test_async_get_all_foreign_keys(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_get_all_foreign_keys()
+        sync_result = pg_backend.get_all_foreign_keys(pg_sync_conn)
+        assert async_result == sync_result
+        # Verify structure
+        assert "with_foreign_key" in async_result
+        assert "simple_primary_key" in async_result
+        assert len(async_result["with_foreign_key"]["outgoing"]) == 1
+        assert len(async_result["simple_primary_key"]["incoming"]) == 1
+        # Tables with no foreign keys should have empty lists
+        assert async_result["compound_pk"]["incoming"] == []
+        assert async_result["compound_pk"]["outgoing"] == []
+
+    # -- async_hidden_table_names --
+
+    @pytest.mark.asyncio
+    async def test_async_hidden_table_names(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_hidden_table_names()
+        sync_result = pg_backend.hidden_table_names(pg_sync_conn)
+        assert async_result == sync_result
+        assert async_result == []
+
+    # -- async_get_table_definition --
+
+    @pytest.mark.asyncio
+    async def test_async_get_table_definition(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_get_table_definition("simple_primary_key")
+        sync_result = pg_backend.get_table_definition(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert async_result is not None
+        assert "CREATE TABLE" in async_result
+        assert "simple_primary_key" in async_result
+
+    @pytest.mark.asyncio
+    async def test_async_get_table_definition_delegates_to_view(self, pg_backend, pg_sync_conn):
+        """When type_='view', it should delegate to async_get_view_definition."""
+        async_result = await pg_backend.async_get_table_definition("my_view", type_="view")
+        sync_result = pg_backend.get_table_definition(pg_sync_conn, "my_view", type_="view")
+        assert async_result == sync_result
+        assert async_result is not None
+        assert "my_view" in async_result
+
+    @pytest.mark.asyncio
+    async def test_async_get_table_definition_nonexistent(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_get_table_definition("nonexistent_table")
+        sync_result = pg_backend.get_table_definition(pg_sync_conn, "nonexistent_table")
+        assert async_result == sync_result
+        assert async_result is None
+
+    # -- async_get_view_definition --
+
+    @pytest.mark.asyncio
+    async def test_async_get_view_definition(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_get_view_definition("my_view")
+        sync_result = pg_backend.get_view_definition(pg_sync_conn, "my_view")
+        assert async_result == sync_result
+        assert async_result is not None
+        assert "my_view" in async_result
+        assert "CREATE VIEW" in async_result
+
+    @pytest.mark.asyncio
+    async def test_async_get_view_definition_nonexistent(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_get_view_definition("nonexistent_view")
+        sync_result = pg_backend.get_view_definition(pg_sync_conn, "nonexistent_view")
+        assert async_result == sync_result
+        assert async_result is None
+
+    # -- async_indexes_for_table --
+
+    @pytest.mark.asyncio
+    async def test_async_indexes_for_table(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_indexes_for_table("simple_primary_key")
+        sync_result = pg_backend.indexes_for_table(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert isinstance(async_result, list)
+        # PostgreSQL creates an index for the primary key
+        assert len(async_result) >= 1
+        # Each index should have the expected keys
+        for idx in async_result:
+            assert "name" in idx
+            assert "unique" in idx
+            assert "sql" in idx
+
+    @pytest.mark.asyncio
+    async def test_async_indexes_for_table_compound_pk(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_indexes_for_table("compound_pk")
+        sync_result = pg_backend.indexes_for_table(pg_sync_conn, "compound_pk")
+        assert async_result == sync_result
+        assert len(async_result) >= 1
+
+    # -- async_label_column_details --
+
+    @pytest.mark.asyncio
+    async def test_async_label_column_details(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_label_column_details("simple_primary_key")
+        sync_result = pg_backend.label_column_details(pg_sync_conn, "simple_primary_key")
+        assert async_result == sync_result
+        assert "id" in async_result
+        assert "content" in async_result
+        # "content" is a text column
+        py_type, is_unique = async_result["content"]
+        assert py_type is str
+        # "id" is an integer column and is a unique primary key
+        py_type_id, is_unique_id = async_result["id"]
+        assert py_type_id is not str
+        assert is_unique_id is True
+
+    @pytest.mark.asyncio
+    async def test_async_label_column_details_compound_pk(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_label_column_details("compound_pk")
+        sync_result = pg_backend.label_column_details(pg_sync_conn, "compound_pk")
+        assert async_result == sync_result
+        assert "pk1" in async_result
+        assert "pk2" in async_result
+        assert "value" in async_result
+
+    # -- async_schema_version --
+
+    @pytest.mark.asyncio
+    async def test_async_schema_version(self, pg_backend, pg_sync_conn):
+        async_result = await pg_backend.async_schema_version()
+        sync_result = pg_backend.schema_version(pg_sync_conn)
+        assert async_result == sync_result
+        assert isinstance(async_result, int)
+        assert async_result > 0
+
+    @pytest.mark.asyncio
+    async def test_async_schema_version_changes_on_ddl(self, pg_backend):
+        """Schema version should change when a table is added or dropped."""
+        version_before = await pg_backend.async_schema_version()
+
+        # Add a new table using a sync write connection
+        write_conn = pg_backend.create_connection(write=True)
+        write_conn.execute(
+            "CREATE TABLE test_schema_version_change (id integer primary key)"
+        )
+        pg_backend.close_connection(write_conn)
+
+        version_after = await pg_backend.async_schema_version()
+        assert version_after != version_before
+
+        # Clean up
+        cleanup_conn = pg_backend.create_connection(write=True)
+        cleanup_conn.execute("DROP TABLE IF EXISTS test_schema_version_change")
+        pg_backend.close_connection(cleanup_conn)
