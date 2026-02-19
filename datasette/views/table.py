@@ -264,7 +264,7 @@ async def display_columns_and_rows(
                         "" if len(value) == 1 else "s",
                     )
                 )
-            elif isinstance(value, dict):
+            elif isinstance(value, dict) and "label" in value and "value" in value:
                 # It's an expanded foreign key - display link to other row
                 label = value["label"]
                 value = value["value"]
