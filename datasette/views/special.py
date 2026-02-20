@@ -988,11 +988,21 @@ class SchemaBaseView(BaseView):
     async def get_database_schema(self, database_name):
         """Get schema SQL for a database."""
         db = self.ds.databases[database_name]
-        result = await db.execute(
-            "select group_concat(sql, ';' || CHAR(10)) as schema from sqlite_master where sql is not null"
-        )
-        row = result.first()
-        return row["schema"] if row and row["schema"] else ""
+
+        def _get_schema(conn):
+            backend = db.backend
+            parts = []
+            for table_name in backend.table_names(conn):
+                defn = backend.get_table_definition(conn, table_name)
+                if defn:
+                    parts.append(defn)
+            for view_name in backend.view_names(conn):
+                defn = backend.get_view_definition(conn, view_name)
+                if defn:
+                    parts.append(defn)
+            return ";\n".join(parts)
+
+        return await db.execute_fn(_get_schema)
 
     def format_json_response(self, data):
         """Format data as JSON response with CORS headers if needed."""
@@ -1130,17 +1140,20 @@ class TableSchemaView(SchemaBaseView):
 
         # Get schema for the table
         db = self.ds.databases[database_name]
-        result = await db.execute(
-            "select sql from sqlite_master where name = ? and sql is not null",
-            [table_name],
-        )
-        row = result.first()
+
+        def _get_table_schema(conn):
+            backend = db.backend
+            defn = backend.get_table_definition(conn, table_name)
+            if defn is None:
+                # Maybe it's a view
+                defn = backend.get_view_definition(conn, table_name)
+            return defn
+
+        schema = await db.execute_fn(_get_table_schema)
 
         # Return 404 if table doesn't exist
-        if not row or not row["sql"]:
+        if not schema:
             return self.format_error_response("Table not found", format_)
-
-        schema = row["sql"]
 
         if format_ == "json":
             return self.format_json_response(

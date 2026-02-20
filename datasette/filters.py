@@ -133,6 +133,7 @@ def through_filters(request, database, table, datasette):
                 other_column = through_data["column"]
                 value = through_data["value"]
                 db = datasette.get_database(database)
+                escape = db.escape_identifier
                 outgoing_foreign_keys = await db.foreign_keys_for_table(through_table)
                 try:
                     fk_to_us = [
@@ -145,10 +146,10 @@ def through_filters(request, database, table, datasette):
                 param = f"p{len(params)}"
                 where_clauses.append(
                     "{our_pk} in (select {our_column} from {through_table} where {other_column} = :{param})".format(
-                        through_table=escape_sqlite(through_table),
-                        our_pk=escape_sqlite(fk_to_us["other_column"]),
-                        our_column=escape_sqlite(fk_to_us["column"]),
-                        other_column=escape_sqlite(other_column),
+                        through_table=escape(through_table),
+                        our_pk=escape(fk_to_us["other_column"]),
+                        our_column=escape(fk_to_us["column"]),
+                        other_column=escape(other_column),
                         param=param,
                     )
                 )
@@ -175,7 +176,7 @@ class Filter:
     display = None
     no_argument = False
 
-    def where_clause(self, table, column, value, param_counter):
+    def where_clause(self, table, column, value, param_counter, escape_fn=None):
         raise NotImplementedError
 
     def human_clause(self, column, value):
@@ -201,7 +202,7 @@ class TemplatedFilter(Filter):
         self.numeric = numeric
         self.no_argument = no_argument
 
-    def where_clause(self, table, column, value, param_counter):
+    def where_clause(self, table, column, value, param_counter, escape_fn=None):
         converted = self.format.format(value)
         if self.numeric and converted.isdigit():
             converted = int(converted)
@@ -233,10 +234,12 @@ class InFilter(Filter):
         else:
             return [v.strip() for v in value.split(",")]
 
-    def where_clause(self, table, column, value, param_counter):
+    def where_clause(self, table, column, value, param_counter, escape_fn=None):
+        if escape_fn is None:
+            escape_fn = escape_sqlite
         values = self.split_value(value)
         params = [f":p{param_counter + i}" for i in range(len(values))]
-        sql = f"{escape_sqlite(column)} in ({', '.join(params)})"
+        sql = f"{escape_fn(column)} in ({', '.join(params)})"
         return sql, values
 
     def human_clause(self, column, value):
@@ -247,10 +250,12 @@ class NotInFilter(InFilter):
     key = "notin"
     display = "not in"
 
-    def where_clause(self, table, column, value, param_counter):
+    def where_clause(self, table, column, value, param_counter, escape_fn=None):
+        if escape_fn is None:
+            escape_fn = escape_sqlite
         values = self.split_value(value)
         params = [f":p{param_counter + i}" for i in range(len(values))]
-        sql = f"{escape_sqlite(column)} not in ({', '.join(params)})"
+        sql = f"{escape_fn(column)} not in ({', '.join(params)})"
         return sql, values
 
     def human_clause(self, column, value):
@@ -408,14 +413,14 @@ class Filters:
     def has_selections(self):
         return bool(self.pairs)
 
-    def build_where_clauses(self, table):
+    def build_where_clauses(self, table, escape_fn=None):
         sql_bits = []
         params = {}
         i = 0
         for column, lookup, value in self.selections():
             filter = self._filters_by_key.get(lookup, None)
             if filter:
-                sql_bit, param = filter.where_clause(table, column, value, i)
+                sql_bit, param = filter.where_clause(table, column, value, i, escape_fn=escape_fn)
                 sql_bits.append(sql_bit)
                 if param is not None:
                     if not isinstance(param, list):

@@ -1,14 +1,8 @@
-import asyncio
 from collections import namedtuple
 from pathlib import Path
-import janus
-import queue
 import sqlite_utils
 import sys
-import threading
-import uuid
 
-from .tracer import trace
 from .utils import (
     detect_fts,
     detect_primary_keys,
@@ -23,8 +17,7 @@ from .utils import (
 )
 from .utils.sqlite import sqlite_version
 from .inspect import inspect_hash
-
-connections = threading.local()
+from .tracer import trace
 
 AttachedDatabase = namedtuple("AttachedDatabase", ("seq", "name", "file"))
 
@@ -32,7 +25,6 @@ AttachedDatabase = namedtuple("AttachedDatabase", ("seq", "name", "file"))
 class Database:
     # For table counts stop at this many rows:
     count_limit = 10000
-    _thread_local_id_counter = 1
 
     def __init__(
         self,
@@ -42,35 +34,48 @@ class Database:
         is_memory=False,
         memory_name=None,
         mode=None,
+        backend=None,
     ):
         self.name = None
-        self._thread_local_id = f"x{self._thread_local_id_counter}"
-        Database._thread_local_id_counter += 1
         self.route = None
         self.ds = ds
-        self.path = path
-        self.is_mutable = is_mutable
-        self.is_memory = is_memory
-        self.memory_name = memory_name
-        if memory_name is not None:
-            self.is_memory = True
         self.cached_hash = None
         self.cached_size = None
         self._cached_table_counts = None
-        self._write_thread = None
-        self._write_queue = None
-        # These are used when in non-threaded mode:
-        self._read_connection = None
-        self._write_connection = None
-        # This is used to track all file connections so they can be closed
-        self._all_file_connections = []
-        self.mode = mode
+
+        # Create backend - SQLiteBackend by default for backward compatibility
+        if backend is not None:
+            self.backend = backend
+        else:
+            from .backends.sqlite import SQLiteBackend
+
+            self.backend = SQLiteBackend(
+                ds=ds,
+                path=path,
+                is_mutable=is_mutable,
+                is_memory=is_memory,
+                memory_name=memory_name,
+                mode=mode,
+                nolock=getattr(ds, "nolock", False),
+            )
+
+        # Expose backend properties for backward compatibility
+        self.path = getattr(self.backend, "path", path)
+        self.is_mutable = getattr(self.backend, "is_mutable", is_mutable)
+        self.is_memory = getattr(self.backend, "is_memory", is_memory)
+        self.memory_name = getattr(self.backend, "memory_name", memory_name)
+        self.mode = getattr(self.backend, "mode", mode)
+
+    def _set_name(self, name):
+        """Called by Datasette.add_database to set the database name."""
+        self.name = name
+        # Tell the backend its database name for tracing etc.
+        self.backend._database_name = name
 
     @property
     def cached_table_counts(self):
         if self._cached_table_counts is not None:
             return self._cached_table_counts
-        # Maybe use self.ds.inspect_data to populate cached_table_counts
         if self.ds.inspect_data and self.ds.inspect_data.get(self.name):
             self._cached_table_counts = {
                 key: value["count"]
@@ -85,236 +90,21 @@ class Database:
         return md5_not_usedforsecurity(self.name)[:6]
 
     def suggest_name(self):
-        if self.path:
-            return Path(self.path).stem
-        elif self.memory_name:
-            return self.memory_name
-        else:
-            return "db"
+        return self.backend.suggest_name()
+
+    # ---- Connection management (delegated) ----
 
     def connect(self, write=False):
-        extra_kwargs = {}
-        if write:
-            extra_kwargs["isolation_level"] = "IMMEDIATE"
-        if self.memory_name:
-            uri = "file:{}?mode=memory&cache=shared".format(self.memory_name)
-            conn = sqlite3.connect(
-                uri, uri=True, check_same_thread=False, **extra_kwargs
-            )
-            if not write:
-                conn.execute("PRAGMA query_only=1")
-            return conn
-        if self.is_memory:
-            return sqlite3.connect(":memory:", uri=True)
-
-        # mode=ro or immutable=1?
-        if self.is_mutable:
-            qs = "?mode=ro"
-            if self.ds.nolock:
-                qs += "&nolock=1"
-        else:
-            qs = "?immutable=1"
-        assert not (write and not self.is_mutable)
-        if write:
-            qs = ""
-        if self.mode is not None:
-            qs = f"?mode={self.mode}"
-        conn = sqlite3.connect(
-            f"file:{self.path}{qs}", uri=True, check_same_thread=False, **extra_kwargs
-        )
-        self._all_file_connections.append(conn)
-        return conn
+        return self.backend.create_connection(write=write)
 
     def close(self):
-        # Close all connections - useful to avoid running out of file handles in tests
-        for connection in self._all_file_connections:
-            connection.close()
+        if hasattr(self.backend, "close_all"):
+            self.backend.close_all()
+        elif hasattr(self.backend, "_all_file_connections"):
+            for conn in self.backend._all_file_connections:
+                conn.close()
 
-    async def execute_write(self, sql, params=None, block=True, request=None):
-        def _inner(conn):
-            return conn.execute(sql, params or [])
-
-        with trace("sql", database=self.name, sql=sql.strip(), params=params):
-            results = await self.execute_write_fn(_inner, block=block, request=request)
-        return results
-
-    async def execute_write_script(self, sql, block=True, request=None):
-        def _inner(conn):
-            return conn.executescript(sql)
-
-        with trace("sql", database=self.name, sql=sql.strip(), executescript=True):
-            results = await self.execute_write_fn(
-                _inner, block=block, transaction=False, request=request
-            )
-        return results
-
-    async def execute_write_many(self, sql, params_seq, block=True, request=None):
-        def _inner(conn):
-            count = 0
-
-            def count_params(params):
-                nonlocal count
-                for param in params:
-                    count += 1
-                    yield param
-
-            return conn.executemany(sql, count_params(params_seq)), count
-
-        with trace(
-            "sql", database=self.name, sql=sql.strip(), executemany=True
-        ) as kwargs:
-            results, count = await self.execute_write_fn(
-                _inner, block=block, request=request
-            )
-            kwargs["count"] = count
-        return results
-
-    async def execute_isolated_fn(self, fn):
-        # Open a new connection just for the duration of this function
-        # blocking the write queue to avoid any writes occurring during it
-        if self.ds.executor is None:
-            # non-threaded mode
-            isolated_connection = self.connect(write=True)
-            try:
-                result = fn(isolated_connection)
-            finally:
-                isolated_connection.close()
-                try:
-                    self._all_file_connections.remove(isolated_connection)
-                except ValueError:
-                    # Was probably a memory connection
-                    pass
-            return result
-        else:
-            # Threaded mode - send to write thread
-            return await self._send_to_write_thread(fn, isolated_connection=True)
-
-    async def execute_write_fn(self, fn, block=True, transaction=True, request=None):
-        fn = self._wrap_fn_with_hooks(fn, request, transaction)
-        if self.ds.executor is None:
-            # non-threaded mode
-            if self._write_connection is None:
-                self._write_connection = self.connect(write=True)
-                self.ds._prepare_connection(self._write_connection, self.name)
-            if transaction:
-                with self._write_connection:
-                    return fn(self._write_connection)
-            else:
-                return fn(self._write_connection)
-        else:
-            return await self._send_to_write_thread(
-                fn, block=block, transaction=transaction
-            )
-
-    def _wrap_fn_with_hooks(self, fn, request, transaction):
-        from .plugins import pm
-
-        wrappers = pm.hook.write_wrapper(
-            datasette=self.ds,
-            database=self.name,
-            request=request,
-            transaction=transaction,
-        )
-        wrappers = [w for w in wrappers if w is not None]
-        if not wrappers:
-            return fn
-        # Build the wrapped fn by nesting context manager generators.
-        # The first wrapper returned by pluggy is outermost.
-        original_fn = fn
-        for wrapper_factory in reversed(wrappers):
-            original_fn = _apply_write_wrapper(original_fn, wrapper_factory)
-        return original_fn
-
-    async def _send_to_write_thread(
-        self, fn, block=True, isolated_connection=False, transaction=True
-    ):
-        if self._write_queue is None:
-            self._write_queue = queue.Queue()
-        if self._write_thread is None:
-            self._write_thread = threading.Thread(
-                target=self._execute_writes, daemon=True
-            )
-            self._write_thread.name = "_execute_writes for database {}".format(
-                self.name
-            )
-            self._write_thread.start()
-        task_id = uuid.uuid5(uuid.NAMESPACE_DNS, "datasette.io")
-        reply_queue = janus.Queue()
-        self._write_queue.put(
-            WriteTask(fn, task_id, reply_queue, isolated_connection, transaction)
-        )
-        if block:
-            result = await reply_queue.async_q.get()
-            if isinstance(result, Exception):
-                raise result
-            else:
-                return result
-        else:
-            return task_id
-
-    def _execute_writes(self):
-        # Infinite looping thread that protects the single write connection
-        # to this database
-        conn_exception = None
-        conn = None
-        try:
-            conn = self.connect(write=True)
-            self.ds._prepare_connection(conn, self.name)
-        except Exception as e:
-            conn_exception = e
-        while True:
-            task = self._write_queue.get()
-            if conn_exception is not None:
-                result = conn_exception
-            else:
-                if task.isolated_connection:
-                    isolated_connection = self.connect(write=True)
-                    try:
-                        result = task.fn(isolated_connection)
-                    except Exception as e:
-                        sys.stderr.write("{}\n".format(e))
-                        sys.stderr.flush()
-                        result = e
-                    finally:
-                        isolated_connection.close()
-                        try:
-                            self._all_file_connections.remove(isolated_connection)
-                        except ValueError:
-                            # Was probably a memory connection
-                            pass
-                else:
-                    try:
-                        if task.transaction:
-                            with conn:
-                                result = task.fn(conn)
-                        else:
-                            result = task.fn(conn)
-                    except Exception as e:
-                        sys.stderr.write("{}\n".format(e))
-                        sys.stderr.flush()
-                        result = e
-            task.reply_queue.sync_q.put(result)
-
-    async def execute_fn(self, fn):
-        if self.ds.executor is None:
-            # non-threaded mode
-            if self._read_connection is None:
-                self._read_connection = self.connect()
-                self.ds._prepare_connection(self._read_connection, self.name)
-            return fn(self._read_connection)
-
-        # threaded mode
-        def in_thread():
-            conn = getattr(connections, self._thread_local_id, None)
-            if not conn:
-                conn = self.connect()
-                self.ds._prepare_connection(conn, self.name)
-                setattr(connections, self._thread_local_id, conn)
-            return fn(conn)
-
-        return await asyncio.get_event_loop().run_in_executor(
-            self.ds.executor, in_thread
-        )
+    # ---- Execution (delegated to backend) ----
 
     async def execute(
         self,
@@ -325,55 +115,191 @@ class Database:
         page_size=None,
         log_sql_errors=True,
     ):
-        """Executes sql against db_name in a thread"""
-        page_size = page_size or self.ds.page_size
+        """Executes sql against this database."""
+        return await self.backend.execute(
+            sql,
+            params=params,
+            truncate=truncate,
+            custom_time_limit=custom_time_limit,
+            page_size=page_size,
+            log_sql_errors=log_sql_errors,
+        )
 
-        def sql_operation_in_thread(conn):
-            time_limit_ms = self.ds.sql_time_limit_ms
-            if custom_time_limit and custom_time_limit < time_limit_ms:
-                time_limit_ms = custom_time_limit
+    async def execute_fn(self, fn):
+        return await self.backend.execute_fn(fn)
 
-            with sqlite_timelimit(conn, time_limit_ms):
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute(sql, params if params is not None else {})
-                    max_returned_rows = self.ds.max_returned_rows
-                    if max_returned_rows == page_size:
-                        max_returned_rows += 1
-                    if max_returned_rows and truncate:
-                        rows = cursor.fetchmany(max_returned_rows + 1)
-                        truncated = len(rows) > max_returned_rows
-                        rows = rows[:max_returned_rows]
-                    else:
-                        rows = cursor.fetchall()
-                        truncated = False
-                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-                    if e.args == ("interrupted",):
-                        raise QueryInterrupted(e, sql, params)
-                    if log_sql_errors:
-                        sys.stderr.write(
-                            "ERROR: conn={}, sql = {}, params = {}: {}\n".format(
-                                conn, repr(sql), params, e
-                            )
-                        )
-                        sys.stderr.flush()
-                    raise
-
-            if truncate:
-                return Results(rows, truncated, cursor.description)
-
-            else:
-                return Results(rows, False, cursor.description)
-
+    async def execute_write(self, sql, params=None, block=True, request=None):
         with trace("sql", database=self.name, sql=sql.strip(), params=params):
-            results = await self.execute_fn(sql_operation_in_thread)
-        return results
+            return await self.backend.execute_write(
+                sql, params=params, block=block, request=request
+            )
+
+    async def execute_write_script(self, sql, block=True, request=None):
+        with trace("sql", database=self.name, sql=sql.strip(), executescript=True):
+            return await self.backend.execute_write_script(
+                sql, block=block, request=request
+            )
+
+    async def execute_write_many(self, sql, params_seq, block=True, request=None):
+        with trace(
+            "sql", database=self.name, sql=sql.strip(), executemany=True
+        ) as kwargs:
+            result = await self.backend.execute_write_many(
+                sql, params_seq, block=block, request=request
+            )
+            if isinstance(result, tuple):
+                kwargs["count"] = result[1]
+                return result[0]
+            return result
+
+    async def execute_write_fn(self, fn, block=True, transaction=True, request=None):
+        return await self.backend.execute_write_fn(
+            fn, block=block, transaction=transaction, request=request
+        )
+
+    async def execute_isolated_fn(self, fn):
+        return await self.backend.execute_isolated_fn(fn)
+
+    # ---- SQL dialect ----
+
+    def escape_identifier(self, identifier):
+        return self.backend.escape_identifier(identifier)
+
+    # ---- Schema introspection ----
+    # Backends that provide async_* methods (e.g. PostgreSQL) use those directly.
+    # Otherwise falls back to execute_fn with sync callbacks (e.g. SQLite).
+
+    def _has_async(self, method):
+        return hasattr(self.backend, f"async_{method}")
+
+    async def table_names(self):
+        if self._has_async("table_names"):
+            return await self.backend.async_table_names()
+        return await self.execute_fn(lambda conn: self.backend.table_names(conn))
+
+    async def view_names(self):
+        if self._has_async("view_names"):
+            return await self.backend.async_view_names()
+        return await self.execute_fn(lambda conn: self.backend.view_names(conn))
+
+    async def table_exists(self, table):
+        if self._has_async("table_exists"):
+            return await self.backend.async_table_exists(table)
+        return await self.execute_fn(lambda conn: self.backend.table_exists(conn, table))
+
+    async def view_exists(self, table):
+        if self._has_async("view_exists"):
+            return await self.backend.async_view_exists(table)
+        return await self.execute_fn(lambda conn: self.backend.view_exists(conn, table))
+
+    async def table_columns(self, table):
+        if self._has_async("table_columns"):
+            return await self.backend.async_table_columns(table)
+        return await self.execute_fn(lambda conn: self.backend.table_columns(conn, table))
+
+    async def table_column_details(self, table):
+        if self._has_async("table_column_details"):
+            return await self.backend.async_table_column_details(table)
+        return await self.execute_fn(lambda conn: self.backend.table_column_details(conn, table))
+
+    async def primary_keys(self, table):
+        if self._has_async("primary_keys"):
+            return await self.backend.async_primary_keys(table)
+        return await self.execute_fn(lambda conn: self.backend.primary_keys(conn, table))
+
+    async def fts_table(self, table):
+        if self._has_async("detect_fts"):
+            return await self.backend.async_detect_fts(table)
+        return await self.execute_fn(lambda conn: self.backend.detect_fts(conn, table))
+
+    async def foreign_keys_for_table(self, table):
+        if self._has_async("foreign_keys_for_table"):
+            return await self.backend.async_foreign_keys_for_table(table)
+        return await self.execute_fn(
+            lambda conn: self.backend.foreign_keys_for_table(conn, table)
+        )
+
+    async def get_all_foreign_keys(self):
+        if self._has_async("get_all_foreign_keys"):
+            return await self.backend.async_get_all_foreign_keys()
+        return await self.execute_fn(lambda conn: self.backend.get_all_foreign_keys(conn))
+
+    async def hidden_table_names(self):
+        hidden_tables = []
+        # Add any tables marked as hidden in config
+        db_config = self.ds.config.get("databases", {}).get(self.name, {})
+        if "tables" in db_config:
+            hidden_tables += [
+                t
+                for t in db_config["tables"]
+                if db_config["tables"][t].get("hidden")
+            ]
+        # Get backend-specific hidden tables
+        if self._has_async("hidden_table_names"):
+            hidden_tables += await self.backend.async_hidden_table_names()
+        else:
+            hidden_tables += await self.execute_fn(
+                lambda conn: self.backend.hidden_table_names(conn)
+            )
+        return hidden_tables
+
+    async def get_table_definition(self, table, type_="table"):
+        if self._has_async("get_table_definition"):
+            return await self.backend.async_get_table_definition(table, type_)
+        return await self.execute_fn(
+            lambda conn: self.backend.get_table_definition(conn, table)
+            if type_ == "table"
+            else self.backend.get_view_definition(conn, table)
+        )
+
+    async def get_view_definition(self, view):
+        if self._has_async("get_view_definition"):
+            return await self.backend.async_get_view_definition(view)
+        return await self.execute_fn(
+            lambda conn: self.backend.get_view_definition(conn, view)
+        )
+
+    async def label_column_for_table(self, table):
+        explicit_label_column = (await self.ds.table_config(self.name, table)).get(
+            "label_column"
+        )
+        if explicit_label_column:
+            return explicit_label_column
+
+        if self._has_async("label_column_details"):
+            column_details = await self.backend.async_label_column_details(table)
+        else:
+            column_details = await self.execute_fn(
+                lambda conn: self.backend.label_column_details(conn, table)
+            )
+        unique_text_columns = [
+            name
+            for name, (type_, is_unique) in column_details.items()
+            if is_unique and type_ is str
+        ]
+        if len(unique_text_columns) == 1:
+            return unique_text_columns[0]
+
+        column_names = list(column_details.keys())
+        name_or_title = [c for c in column_names if c.lower() in ("name", "title")]
+        if name_or_title:
+            return name_or_title[0]
+        if (
+            column_names
+            and len(column_names) == 2
+            and ("id" in column_names or "pk" in column_names)
+            and not set(column_names) == {"id", "pk"}
+        ):
+            return [c for c in column_names if c not in ("id", "pk")][0]
+        return None
+
+    # ---- Properties ----
 
     @property
     def hash(self):
         if self.cached_hash is not None:
             return self.cached_hash
-        elif self.is_mutable or self.is_memory:
+        elif self.is_mutable or self.is_memory or not self.path:
             return None
         elif self.ds.inspect_data and self.ds.inspect_data.get(self.name):
             self.cached_hash = self.ds.inspect_data[self.name]["hash"]
@@ -387,7 +313,7 @@ class Database:
     def size(self):
         if self.cached_size is not None:
             return self.cached_size
-        elif self.is_memory:
+        elif self.is_memory or not self.path:
             return 0
         elif self.is_mutable:
             return Path(self.path).stat().st_size
@@ -401,20 +327,18 @@ class Database:
     async def table_counts(self, limit=10):
         if not self.is_mutable and self.cached_table_counts is not None:
             return self.cached_table_counts
-        # Try to get counts for each table, $limit timeout for each count
         counts = {}
+        escape = self.backend.escape_identifier
         for table in await self.table_names():
             try:
                 table_count = (
                     await self.execute(
-                        f"select count(*) from (select * from [{table}] limit {self.count_limit + 1})",
+                        f"select count(*) from (select * from {escape(table)} limit {self.count_limit + 1})",
                         custom_time_limit=limit,
                     )
                 ).rows[0][0]
                 counts[table] = table_count
-            # In some cases I saw "SQL Logic Error" here in addition to
-            # QueryInterrupted - so we catch that too:
-            except (QueryInterrupted, sqlite3.OperationalError, sqlite3.DatabaseError):
+            except Exception:
                 counts[table] = None
         if not self.is_mutable:
             self._cached_table_counts = counts
@@ -422,249 +346,19 @@ class Database:
 
     @property
     def mtime_ns(self):
-        if self.is_memory:
+        if self.is_memory or not self.path:
             return None
         return Path(self.path).stat().st_mtime_ns
 
     async def attached_databases(self):
-        # This used to be:
-        #   select seq, name, file from pragma_database_list() where seq > 0
-        # But SQLite prior to 3.16.0 doesn't support pragma functions
+        if self.backend.backend_type != "sqlite":
+            return []
         results = await self.execute("PRAGMA database_list;")
-        # {'seq': 0, 'name': 'main', 'file': ''}
         return [
             AttachedDatabase(*row)
             for row in results.rows
-            # Filter out the SQLite internal "temp" database, refs #2557
             if row["seq"] > 0 and row["name"] != "temp"
         ]
-
-    async def table_exists(self, table):
-        results = await self.execute(
-            "select 1 from sqlite_master where type='table' and name=?", params=(table,)
-        )
-        return bool(results.rows)
-
-    async def view_exists(self, table):
-        results = await self.execute(
-            "select 1 from sqlite_master where type='view' and name=?", params=(table,)
-        )
-        return bool(results.rows)
-
-    async def table_names(self):
-        results = await self.execute(
-            "select name from sqlite_master where type='table' order by name"
-        )
-        return [r[0] for r in results.rows]
-
-    async def table_columns(self, table):
-        return await self.execute_fn(lambda conn: table_columns(conn, table))
-
-    async def table_column_details(self, table):
-        return await self.execute_fn(lambda conn: table_column_details(conn, table))
-
-    async def primary_keys(self, table):
-        return await self.execute_fn(lambda conn: detect_primary_keys(conn, table))
-
-    async def fts_table(self, table):
-        return await self.execute_fn(lambda conn: detect_fts(conn, table))
-
-    async def label_column_for_table(self, table):
-        explicit_label_column = (await self.ds.table_config(self.name, table)).get(
-            "label_column"
-        )
-        if explicit_label_column:
-            return explicit_label_column
-
-        def column_details(conn):
-            # Returns {column_name: (type, is_unique)}
-            db = sqlite_utils.Database(conn)
-            columns = db[table].columns_dict
-            indexes = db[table].indexes
-            details = {}
-            for name in columns:
-                is_unique = any(
-                    index
-                    for index in indexes
-                    if index.columns == [name] and index.unique
-                )
-                details[name] = (columns[name], is_unique)
-            return details
-
-        column_details = await self.execute_fn(column_details)
-        # Is there just one unique column that's text?
-        unique_text_columns = [
-            name
-            for name, (type_, is_unique) in column_details.items()
-            if is_unique and type_ is str
-        ]
-        if len(unique_text_columns) == 1:
-            return unique_text_columns[0]
-
-        column_names = list(column_details.keys())
-        # Is there a name or title column?
-        name_or_title = [c for c in column_names if c.lower() in ("name", "title")]
-        if name_or_title:
-            return name_or_title[0]
-        # If a table has two columns, one of which is ID, then label_column is the other one
-        if (
-            column_names
-            and len(column_names) == 2
-            and ("id" in column_names or "pk" in column_names)
-            and not set(column_names) == {"id", "pk"}
-        ):
-            return [c for c in column_names if c not in ("id", "pk")][0]
-        # Couldn't find a label:
-        return None
-
-    async def foreign_keys_for_table(self, table):
-        return await self.execute_fn(
-            lambda conn: get_outbound_foreign_keys(conn, table)
-        )
-
-    async def hidden_table_names(self):
-        hidden_tables = []
-        # Add any tables marked as hidden in config
-        db_config = self.ds.config.get("databases", {}).get(self.name, {})
-        if "tables" in db_config:
-            hidden_tables += [
-                t for t in db_config["tables"] if db_config["tables"][t].get("hidden")
-            ]
-
-        if sqlite_version()[1] >= 37:
-            hidden_tables += [x[0] for x in await self.execute("""
-                      with shadow_tables as (
-                        select name
-                        from pragma_table_list
-                        where [type] = 'shadow'
-                        order by name
-                      ),
-                      core_tables as (
-                        select name
-                        from sqlite_master
-                        WHERE  name in ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4')
-                          OR substr(name, 1, 1) == '_'
-                      ),
-                      combined as (
-                        select name from shadow_tables
-                        union all
-                        select name from core_tables
-                      )
-                      select name from combined order by 1
-                    """)]
-        else:
-            hidden_tables += [x[0] for x in await self.execute("""
-                      WITH base AS (
-                        SELECT name
-                        FROM sqlite_master
-                        WHERE  name IN ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4')
-                          OR substr(name, 1, 1) == '_'
-                      ),
-                      fts_suffixes AS (
-                        SELECT column1 AS suffix
-                        FROM (VALUES ('_data'), ('_idx'), ('_docsize'), ('_content'), ('_config'))
-                      ),
-                      fts5_names AS (
-                        SELECT name
-                        FROM sqlite_master
-                        WHERE sql LIKE '%VIRTUAL TABLE%USING FTS%'
-                      ),
-                      fts5_shadow_tables AS (
-                        SELECT
-                          printf('%s%s', fts5_names.name, fts_suffixes.suffix) AS name
-                        FROM fts5_names
-                        JOIN fts_suffixes
-                      ),
-                      fts3_suffixes AS (
-                        SELECT column1 AS suffix
-                        FROM (VALUES ('_content'), ('_segdir'), ('_segments'), ('_stat'), ('_docsize'))
-                      ),
-                      fts3_names AS (
-                        SELECT name
-                        FROM sqlite_master
-                        WHERE sql LIKE '%VIRTUAL TABLE%USING FTS3%'
-                          OR sql LIKE '%VIRTUAL TABLE%USING FTS4%'
-                      ),
-                      fts3_shadow_tables AS (
-                        SELECT
-                          printf('%s%s', fts3_names.name, fts3_suffixes.suffix) AS name
-                        FROM fts3_names
-                        JOIN fts3_suffixes
-                      ),
-                      final AS (
-                        SELECT name FROM base
-                        UNION ALL
-                        SELECT name FROM fts5_shadow_tables
-                        UNION ALL
-                        SELECT name FROM fts3_shadow_tables
-                      )
-                      SELECT name FROM final ORDER BY 1
-                    """)]
-        # Also hide any FTS tables that have a content= argument
-        hidden_tables += [x[0] for x in await self.execute("""
-                  SELECT name
-                  FROM sqlite_master
-                  WHERE sql LIKE '%VIRTUAL TABLE%'
-                    AND sql LIKE '%USING FTS%'
-                    AND sql LIKE '%content=%'
-                """)]
-
-        has_spatialite = await self.execute_fn(detect_spatialite)
-        if has_spatialite:
-            # Also hide Spatialite internal tables
-            hidden_tables += [
-                "ElementaryGeometries",
-                "SpatialIndex",
-                "geometry_columns",
-                "spatial_ref_sys",
-                "spatialite_history",
-                "sql_statements_log",
-                "sqlite_sequence",
-                "views_geometry_columns",
-                "virts_geometry_columns",
-                "data_licenses",
-                "KNN",
-                "KNN2",
-            ] + [
-                r[0] for r in (await self.execute("""
-                        select name from sqlite_master
-                        where name like "idx_%"
-                        and type = "table"
-                    """)).rows
-            ]
-
-        return hidden_tables
-
-    async def view_names(self):
-        results = await self.execute("select name from sqlite_master where type='view'")
-        return [r[0] for r in results.rows]
-
-    async def get_all_foreign_keys(self):
-        return await self.execute_fn(get_all_foreign_keys)
-
-    async def get_table_definition(self, table, type_="table"):
-        table_definition_rows = list(
-            await self.execute(
-                "select sql from sqlite_master where name = :n and type=:t",
-                {"n": table, "t": type_},
-            )
-        )
-        if not table_definition_rows:
-            return None
-        bits = [table_definition_rows[0][0] + ";"]
-        # Add on any indexes
-        index_rows = list(
-            await self.execute(
-                "select sql from sqlite_master where tbl_name = :n and type='index' and sql is not null",
-                {"n": table},
-            )
-        )
-        for index_row in index_rows:
-            bits.append(index_row[0] + ";")
-        return "\n".join(bits)
-
-    async def get_view_definition(self, view):
-        return await self.get_table_definition(view, "view")
 
     def __repr__(self):
         tags = []
@@ -680,58 +374,6 @@ class Database:
         if tags:
             tags_str = f" ({', '.join(tags)})"
         return f"<Database: {self.name}{tags_str}>"
-
-
-def _apply_write_wrapper(fn, wrapper_factory):
-    """Apply a single write_wrapper context manager around fn.
-
-    ``wrapper_factory`` is a callable that takes ``(conn)`` and returns a
-    generator that yields exactly once.  Code before the yield runs before
-    ``fn(conn)``, code after the yield runs after.  The result of
-    ``fn(conn)`` is sent into the generator via ``.send()``, and any
-    exception raised by ``fn(conn)`` is thrown via ``.throw()``.
-    """
-
-    def wrapped(conn):
-        gen = wrapper_factory(conn)
-        # Advance to the yield point (run "before" code)
-        try:
-            next(gen)
-        except StopIteration:
-            # Generator didn't yield — just run fn unchanged
-            return fn(conn)
-
-        # Execute the actual write
-        try:
-            result = fn(conn)
-        except Exception:
-            # Throw exception into generator so it can handle it
-            try:
-                gen.throw(*sys.exc_info())
-            except StopIteration:
-                pass
-            # Re-raise the original exception
-            raise
-        else:
-            # Send the result back through the yield
-            try:
-                gen.send(result)
-            except StopIteration:
-                pass
-            return result
-
-    return wrapped
-
-
-class WriteTask:
-    __slots__ = ("fn", "task_id", "reply_queue", "isolated_connection", "transaction")
-
-    def __init__(self, fn, task_id, reply_queue, isolated_connection, transaction):
-        self.fn = fn
-        self.task_id = task_id
-        self.reply_queue = reply_queue
-        self.isolated_connection = isolated_connection
-        self.transaction = transaction
 
 
 class QueryInterrupted(Exception):

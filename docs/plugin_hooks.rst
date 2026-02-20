@@ -147,6 +147,90 @@ The ``conn`` object passed to the generator is the same connection that the writ
 
 When multiple plugins implement ``write_wrapper``, they are nested following pluggy's default calling convention.
 
+.. _plugin_hook_register_database_backends:
+
+register_database_backends(datasette)
+-------------------------------------
+
+``datasette`` - :ref:`internals_datasette`
+    You can use this to access plugin configuration options via ``datasette.plugin_config(your_plugin_name)``
+
+.. note::
+
+    This hook is a **preview feature** and is only active when Datasette is started with the ``--preview`` flag. See :ref:`cli_datasette_serve_preview` for details.
+
+This hook allows plugins to register custom database backend classes. Each backend class must be a subclass of ``DatabaseBackend`` and must define a ``backend_type`` class attribute (e.g. ``"sqlite"``, ``"postgresql"``). The ``backend_type`` is used when resolving which backend to use for a given database.
+
+Return a list of ``DatabaseBackend`` subclasses. These will be registered in Datasette's backend registry during startup, making them available for use with databases that specify a matching backend type.
+
+This hook can return a list or an awaitable function that returns a list.
+
+.. code-block:: python
+
+    from datasette import hookimpl
+    from datasette.backends.base import DatabaseBackend
+
+
+    class MyCustomBackend(DatabaseBackend):
+        backend_type = "custom"
+
+        def create_connection(self, write=False):
+            # Return a new connection object
+            ...
+
+        def prepare_connection(self, conn, datasette, database_name):
+            # Configure the connection
+            ...
+
+        async def execute(self, sql, params=None, **kwargs):
+            # Execute a SQL query and return results
+            ...
+
+        async def execute_fn(self, fn):
+            # Execute a callable on the connection
+            ...
+
+        async def execute_write_fn(self, fn, **kwargs):
+            # Execute a write callable on the connection
+            ...
+
+        def escape_identifier(self, identifier):
+            # Escape a SQL identifier for this backend
+            return f'"{identifier}"'
+
+        def table_names(self, conn):
+            # Return list of table names
+            ...
+
+        def view_names(self, conn):
+            # Return list of view names
+            ...
+
+        def table_columns(self, conn, table):
+            # Return list of column names for a table
+            ...
+
+        def table_column_details(self, conn, table):
+            # Return list of Column namedtuples
+            ...
+
+        def primary_keys(self, conn, table):
+            # Return list of primary key column names
+            ...
+
+        def foreign_keys_for_table(self, conn, table):
+            # Return list of foreign key definitions
+            ...
+
+        def get_all_foreign_keys(self, conn):
+            # Return dict of all foreign keys
+            ...
+
+
+    @hookimpl
+    def register_database_backends(datasette):
+        return [MyCustomBackend]
+
 .. _plugin_hook_prepare_jinja2_environment:
 
 prepare_jinja2_environment(env, datasette)

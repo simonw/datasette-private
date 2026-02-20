@@ -67,6 +67,9 @@ class Facet:
     type = None
     # How many rows to consider when suggesting facets:
     suggest_consider = 1000
+    # Set to a tuple of backend types (e.g. ("sqlite",)) to restrict this
+    # facet to specific backends. None means all backends.
+    backend_types = None
 
     def __init__(
         self,
@@ -85,11 +88,21 @@ class Facet:
         self.database = database
         # For foreign key expansion. Can be None for e.g. canned SQL queries:
         self.table = table
-        self.sql = sql or f"select * from [{table}]"
+        if sql:
+            self.sql = sql
+        else:
+            self.sql = f"select * from {self._get_escape()(table)}"
         self.params = params or []
         self.table_config = table_config
         # row_count can be None, in which case we calculate it ourselves:
         self.row_count = row_count
+
+    def _get_escape(self):
+        """Return the escape_identifier function for the current database backend."""
+        db = self.ds.databases.get(self.database)
+        if db:
+            return db.escape_identifier
+        return escape_sqlite
 
     def get_configs(self):
         configs = load_facet_configs(self.request, self.table_config)
@@ -156,6 +169,7 @@ class ColumnFacet(Facet):
         columns = await self.get_columns(self.sql, self.params)
         facet_size = self.get_facet_size()
         suggested_facets = []
+        escape = self._get_escape()
         already_enabled = [c["config"]["simple"] for c in self.get_configs()]
         for column in columns:
             if column in already_enabled:
@@ -163,11 +177,11 @@ class ColumnFacet(Facet):
             suggested_facet_sql = """
                 with limited as (select * from ({sql}) limit {suggest_consider})
                 select {column} as value, count(*) as n from limited
-                where value is not null
-                group by value
+                where {column} is not null
+                group by {column}
                 limit {limit}
             """.format(
-                column=escape_sqlite(column),
+                column=escape(column),
                 sql=self.sql,
                 limit=facet_size + 1,
                 suggest_consider=self.suggest_consider,
@@ -223,6 +237,7 @@ class ColumnFacet(Facet):
         qs_pairs = self.get_querystring_pairs()
 
         facet_size = self.get_facet_size()
+        escape = self._get_escape()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
@@ -233,7 +248,7 @@ class ColumnFacet(Facet):
                 )
                 where {col} is not null
                 group by {col} order by count desc, value limit {limit}
-            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
+            """.format(col=escape(column), sql=self.sql, limit=facet_size + 1)
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
@@ -296,6 +311,7 @@ class ColumnFacet(Facet):
 
 class ArrayFacet(Facet):
     type = "array"
+    backend_types = ("sqlite",)
 
     def _is_json_array_of_strings(self, json_string):
         try:
@@ -310,6 +326,7 @@ class ArrayFacet(Facet):
     async def suggest(self):
         columns = await self.get_columns(self.sql, self.params)
         suggested_facets = []
+        escape = self._get_escape()
         already_enabled = [c["config"]["simple"] for c in self.get_configs()]
         for column in columns:
             if column in already_enabled:
@@ -321,7 +338,7 @@ class ArrayFacet(Facet):
                 from limited
                 where {column} is not null and {column} != ''
             """.format(
-                column=escape_sqlite(column),
+                column=escape(column),
                 sql=self.sql,
                 suggest_consider=self.suggest_consider,
             )
@@ -347,7 +364,7 @@ class ArrayFacet(Facet):
                                 "and {column} != '' "
                                 "and json_array_length({column}) > 0 "
                                 "limit 100"
-                            ).format(column=escape_sqlite(column), sql=self.sql),
+                            ).format(column=escape(column), sql=self.sql),
                             self.params,
                             truncate=False,
                             custom_time_limit=self.ds.setting(
@@ -383,6 +400,7 @@ class ArrayFacet(Facet):
         facets_timed_out = []
 
         facet_size = self.get_facet_size()
+        escape = self._get_escape()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
@@ -408,7 +426,7 @@ class ArrayFacet(Facet):
                 order by
                     count(*) desc, value limit {limit}
             """.format(
-                col=escape_sqlite(column),
+                col=escape(column),
                 sql=self.sql,
                 limit=facet_size + 1,
             )
@@ -467,11 +485,13 @@ class ArrayFacet(Facet):
 
 class DateFacet(Facet):
     type = "date"
+    backend_types = ("sqlite",)
 
     async def suggest(self):
         columns = await self.get_columns(self.sql, self.params)
         already_enabled = [c["config"]["simple"] for c in self.get_configs()]
         suggested_facets = []
+        escape = self._get_escape()
         for column in columns:
             if column in already_enabled:
                 continue
@@ -480,7 +500,7 @@ class DateFacet(Facet):
                 select date({column}) from (
                     select * from ({sql}) limit 100
                 ) where {column} glob "????-??-*"
-            """.format(column=escape_sqlite(column), sql=self.sql)
+            """.format(column=escape(column), sql=self.sql)
             try:
                 results = await self.ds.execute(
                     self.database,
@@ -515,6 +535,7 @@ class DateFacet(Facet):
         facets_timed_out = []
         args = dict(self.get_querystring_pairs())
         facet_size = self.get_facet_size()
+        escape = self._get_escape()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
@@ -526,7 +547,7 @@ class DateFacet(Facet):
                 )
                 where date({col}) is not null
                 group by date({col}) order by count desc, value limit {limit}
-            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
+            """.format(col=escape(column), sql=self.sql, limit=facet_size + 1)
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,

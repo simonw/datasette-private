@@ -223,6 +223,16 @@ def top_canned_query(datasette, request, database, query_name):
 
 
 @hookspec
+def register_database_backends(datasette):
+    """Return a list of DatabaseBackend subclasses to register.
+
+    Each backend subclass must have a ``backend_type`` class attribute
+    (e.g., ``"sqlite"``, ``"postgresql"``) and accept a ``connection_string``
+    keyword argument in its constructor.
+    """
+
+
+@hookspec
 def write_wrapper(datasette, database, request, transaction):
     """Called when a write function is about to execute.
 

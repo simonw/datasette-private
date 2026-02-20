@@ -7,11 +7,9 @@ from datasette.utils import (
     await_me_maybe,
     make_slot_function,
     to_css_class,
-    escape_sqlite,
 )
 from datasette.plugins import pm
 import json
-import sqlite_utils
 from .table import display_columns_and_rows, _get_extras
 
 
@@ -162,11 +160,12 @@ class RowView(DataView):
         if len(foreign_keys) == 0:
             return []
 
+        escape = db.escape_identifier
         sql = "select " + ", ".join(
             [
                 "(select count(*) from {table} where {column}=:id)".format(
-                    table=escape_sqlite(fk["other_table"]),
-                    column=escape_sqlite(fk["other_column"]),
+                    table=escape(fk["other_table"]),
+                    column=escape(fk["other_column"]),
                 )
                 for fk in foreign_keys
             ]
@@ -241,9 +240,11 @@ class RowDeleteView(BaseView):
         if not ok:
             return resolved
 
-        # Delete table
+        # Delete row
         def delete_row(conn):
-            sqlite_utils.Database(conn)[resolved.table].delete(resolved.pk_values)
+            resolved.db.backend.write_delete_row(
+                conn, resolved.table, resolved.pks, resolved.pk_values
+            )
 
         try:
             await resolved.db.execute_write_fn(delete_row, request=request)
@@ -301,8 +302,9 @@ class RowUpdateView(BaseView):
             return _error(["Permission denied for alter-table"], 403)
 
         def update_row(conn):
-            sqlite_utils.Database(conn)[resolved.table].update(
-                resolved.pk_values, update, alter=alter
+            resolved.db.backend.write_update_row(
+                conn, resolved.table, resolved.pks, resolved.pk_values,
+                update, alter=alter,
             )
 
         try:

@@ -496,6 +496,11 @@ def uninstall(packages, yes):
     type=click.Path(),
     help="Path to a persistent Datasette internal SQLite database",
 )
+@click.option(
+    "--preview",
+    is_flag=True,
+    help="Enable preview features, including support for alternative database backends",
+)
 def serve(
     files,
     immutable,
@@ -530,6 +535,7 @@ def serve(
     ssl_keyfile,
     ssl_certfile,
     internal,
+    preview,
     return_instance=False,
 ):
     """Serve up specified SQLite database files with a web UI"""
@@ -597,11 +603,14 @@ def serve(
         nolock=nolock,
         internal=internal,
         default_deny=default_deny,
+        preview=preview,
     )
 
-    # Separate directories from files
-    directories = [f for f in files if os.path.isdir(f)]
-    file_paths = [f for f in files if not os.path.isdir(f)]
+    # Separate connection strings, directories, and file paths
+    connection_strings = [f for f in files if "://" in f]
+    non_connection_strings = [f for f in files if "://" not in f]
+    directories = [f for f in non_connection_strings if os.path.isdir(f)]
+    file_paths = [f for f in non_connection_strings if not os.path.isdir(f)]
 
     # Handle config_dir - only one directory allowed
     if len(directories) > 1:
@@ -656,6 +665,21 @@ def serve(
         raise click.ClickException("Could not find SpatiaLite extension")
     except StartupError as e:
         raise click.ClickException(e.args[0])
+
+    # Add connection-string databases (e.g., postgresql://...)
+    from .database import Database
+
+    for conn_str in connection_strings:
+        scheme = conn_str.split("://")[0]
+        backend_cls = ds._backend_registry.get(scheme)
+        if not backend_cls:
+            raise click.ClickException(
+                f"Unknown database backend scheme: '{scheme}'. "
+                f"Available: {', '.join(sorted(ds._backend_registry.keys()))}"
+            )
+        backend = backend_cls(ds=ds, connection_string=conn_str)
+        name = backend.suggest_name()
+        ds.add_database(Database(ds, backend=backend), name=name)
 
     if return_instance:
         # Private utility mechanism for writing unit tests
@@ -862,6 +886,9 @@ async def check_databases(ds):
     # Run check_connection against every connected database
     # to confirm they are all usable
     for database in list(ds.databases.values()):
+        # check_connection is SQLite-specific (uses sqlite_master, PRAGMA)
+        if hasattr(database, "backend") and database.backend.backend_type != "sqlite":
+            continue
         try:
             await database.execute_fn(check_connection)
         except SpatialiteConnectionProblem:

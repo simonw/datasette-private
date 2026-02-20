@@ -1,4 +1,5 @@
 from datasette.app import Datasette
+from datasette.database import Database
 from datasette.utils import sqlite3
 from .utils import last_event
 import pytest
