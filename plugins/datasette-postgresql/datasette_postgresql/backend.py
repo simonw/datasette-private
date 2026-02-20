@@ -20,8 +20,8 @@ import psycopg
 import psycopg.errors
 import psycopg.rows
 
-from .base import DatabaseBackend, Column
-from ..tracer import trace
+from datasette.backends.base import DatabaseBackend, Column
+from datasette.tracer import trace
 
 
 # PostgreSQL reserved words (common ones that need quoting)
@@ -227,7 +227,7 @@ class PostgresBackend(DatabaseBackend):
                             rows = await cursor.fetchall()
                             truncated = False
                     except psycopg.errors.QueryCanceled as e:
-                        from ..database import QueryInterrupted
+                        from datasette.database import QueryInterrupted
 
                         raise QueryInterrupted(e, sql, params)
                     except (psycopg.errors.OperationalError, psycopg.errors.DatabaseError) as e:
@@ -240,7 +240,7 @@ class PostgresBackend(DatabaseBackend):
                             sys.stderr.flush()
                         raise
 
-        from ..database import Results
+        from datasette.database import Results
 
         if truncate:
             return Results(rows, truncated, cursor.description)
@@ -343,7 +343,7 @@ class PostgresBackend(DatabaseBackend):
     def _wrap_fn_with_hooks(self, fn, request, transaction):
         if self.ds is None:
             return fn
-        from ..plugins import pm
+        from datasette.plugins import pm
 
         wrappers = pm.hook.write_wrapper(
             datasette=self.ds,

@@ -1,7 +1,7 @@
-"""Parameterized integration tests that run against both SQLite and PostgreSQL backends.
+"""Integration tests for PostgreSQL backend with Datasette HTTP API.
 
-These test the Datasette HTTP API layer to verify that both backends produce
-identical results for common operations.
+Requires a PostgreSQL server. Set DATASETTE_TEST_POSTGRESQL=postgresql://...
+to enable these tests.
 """
 
 import os
@@ -12,23 +12,19 @@ import pytest_asyncio
 
 from datasette.app import Datasette
 from datasette.database import Database
+from datasette_postgresql.backend import PostgresBackend
 
 
 POSTGRESQL_TEST_URL = os.environ.get("DATASETTE_TEST_POSTGRESQL")
 
-
-def _make_sqlite_ds():
-    """Create a Datasette with an in-memory SQLite backend."""
-    name = f"test_integration_{secrets.token_hex(4)}"
-    ds = Datasette(settings={"num_sql_threads": 1})
-    db = ds.add_database(Database(ds, memory_name=name), name="testdb")
-    return ds, db
+requires_postgresql = pytest.mark.skipif(
+    not POSTGRESQL_TEST_URL,
+    reason="Set DATASETTE_TEST_POSTGRESQL=postgresql://... to run PostgreSQL tests",
+)
 
 
 def _make_pg_ds(pg_schema):
     """Create a Datasette with a PostgreSQL backend."""
-    from datasette.backends.postgresql import PostgresBackend
-
     ds = Datasette(settings={"num_sql_threads": 1})
     backend = PostgresBackend(
         ds=ds,
@@ -43,8 +39,7 @@ def _make_pg_ds(pg_schema):
 def pg_integration_schema():
     """Create a fresh PostgreSQL schema for each test."""
     if not POSTGRESQL_TEST_URL:
-        yield None
-        return
+        pytest.skip("No PostgreSQL configured")
     import psycopg
 
     schema_name = f"test_int_{secrets.token_hex(4)}"
@@ -58,31 +53,11 @@ def pg_integration_schema():
     cleanup_conn.close()
 
 
-@pytest.fixture(
-    params=[
-        "sqlite",
-        pytest.param(
-            "postgresql",
-            marks=pytest.mark.skipif(
-                not POSTGRESQL_TEST_URL,
-                reason="Set DATASETTE_TEST_POSTGRESQL to run PostgreSQL tests",
-            ),
-        ),
-    ]
-)
-def backend_type(request):
-    return request.param
-
-
 @pytest_asyncio.fixture
-async def ds_client(backend_type, pg_integration_schema):
-    """Create a Datasette client with test data on the specified backend."""
-    if backend_type == "sqlite":
-        ds, db = _make_sqlite_ds()
-    else:
-        ds, db = _make_pg_ds(pg_integration_schema)
+async def pg_client(pg_integration_schema):
+    """Create a Datasette client with test data on PostgreSQL."""
+    ds, db = _make_pg_ds(pg_integration_schema)
 
-    # Populate test data using standard SQL that works on both backends
     async def setup_data():
         await db.execute_write(
             "CREATE TABLE IF NOT EXISTS simple_primary_key ("
@@ -111,17 +86,18 @@ async def ds_client(backend_type, pg_integration_schema):
     yield ds.client
 
 
-class TestBothBackendsIntegration:
+@requires_postgresql
+class TestPostgreSQLIntegration:
     @pytest.mark.asyncio
-    async def test_homepage(self, ds_client):
-        response = await ds_client.get("/.json")
+    async def test_homepage(self, pg_client):
+        response = await pg_client.get("/.json")
         assert response.status_code == 200
         data = response.json()
         assert "testdb" in data["databases"]
 
     @pytest.mark.asyncio
-    async def test_database_page(self, ds_client):
-        response = await ds_client.get("/testdb.json")
+    async def test_database_page(self, pg_client):
+        response = await pg_client.get("/testdb.json")
         assert response.status_code == 200
         data = response.json()
         table_names = [t["name"] for t in data["tables"]]
@@ -129,8 +105,8 @@ class TestBothBackendsIntegration:
         assert "compound_pk" in table_names
 
     @pytest.mark.asyncio
-    async def test_table_view(self, ds_client):
-        response = await ds_client.get("/testdb/simple_primary_key.json?_shape=array")
+    async def test_table_view(self, pg_client):
+        response = await pg_client.get("/testdb/simple_primary_key.json?_shape=array")
         assert response.status_code == 200
         data = response.json()
         assert len(data) == 3
@@ -138,8 +114,8 @@ class TestBothBackendsIntegration:
         assert data[0]["content"] == "hello"
 
     @pytest.mark.asyncio
-    async def test_table_view_with_filter(self, ds_client):
-        response = await ds_client.get(
+    async def test_table_view_with_filter(self, pg_client):
+        response = await pg_client.get(
             "/testdb/simple_primary_key.json?content=hello&_shape=array"
         )
         assert response.status_code == 200
@@ -148,8 +124,8 @@ class TestBothBackendsIntegration:
         assert data[0]["content"] == "hello"
 
     @pytest.mark.asyncio
-    async def test_table_view_with_sort(self, ds_client):
-        response = await ds_client.get(
+    async def test_table_view_with_sort(self, pg_client):
+        response = await pg_client.get(
             "/testdb/simple_primary_key.json?_sort_desc=id&_shape=array"
         )
         assert response.status_code == 200
@@ -158,16 +134,16 @@ class TestBothBackendsIntegration:
         assert data[-1]["id"] == 1
 
     @pytest.mark.asyncio
-    async def test_row_view(self, ds_client):
-        response = await ds_client.get("/testdb/simple_primary_key/1.json")
+    async def test_row_view(self, pg_client):
+        response = await pg_client.get("/testdb/simple_primary_key/1.json")
         assert response.status_code == 200
         data = response.json()
         assert data["rows"][0]["id"] == 1
         assert data["rows"][0]["content"] == "hello"
 
     @pytest.mark.asyncio
-    async def test_compound_pk_row(self, ds_client):
-        response = await ds_client.get("/testdb/compound_pk/a,b.json")
+    async def test_compound_pk_row(self, pg_client):
+        response = await pg_client.get("/testdb/compound_pk/a,b.json")
         assert response.status_code == 200
         data = response.json()
         assert data["rows"][0]["pk1"] == "a"
@@ -175,8 +151,8 @@ class TestBothBackendsIntegration:
         assert data["rows"][0]["value"] == "ab_val"
 
     @pytest.mark.asyncio
-    async def test_arbitrary_sql(self, ds_client):
-        response = await ds_client.get(
+    async def test_arbitrary_sql(self, pg_client):
+        response = await pg_client.get(
             "/testdb/-/query.json?sql=select+count(*)+as+cnt+from+simple_primary_key&_shape=array"
         )
         assert response.status_code == 200
@@ -184,23 +160,23 @@ class TestBothBackendsIntegration:
         assert data[0]["cnt"] == 3
 
     @pytest.mark.asyncio
-    async def test_table_rows(self, ds_client):
-        response = await ds_client.get("/testdb/simple_primary_key.json")
+    async def test_table_rows(self, pg_client):
+        response = await pg_client.get("/testdb/simple_primary_key.json")
         assert response.status_code == 200
         data = response.json()
         assert len(data["rows"]) == 3
 
     @pytest.mark.asyncio
-    async def test_table_schema(self, ds_client):
-        response = await ds_client.get("/testdb/simple_primary_key/-/schema.json")
+    async def test_table_schema(self, pg_client):
+        response = await pg_client.get("/testdb/simple_primary_key/-/schema.json")
         assert response.status_code == 200
         data = response.json()
         assert "simple_primary_key" in data.get("schema", "")
 
     @pytest.mark.asyncio
-    async def test_pagination(self, ds_client):
+    async def test_pagination(self, pg_client):
         # Request with _size=1 to force pagination
-        response = await ds_client.get(
+        response = await pg_client.get(
             "/testdb/simple_primary_key.json?_size=1&_shape=array"
         )
         assert response.status_code == 200
@@ -211,16 +187,12 @@ class TestBothBackendsIntegration:
 # ---- Mixed Backend Test ----
 
 
-@pytest.mark.skipif(
-    not POSTGRESQL_TEST_URL,
-    reason="Set DATASETTE_TEST_POSTGRESQL to run mixed backend tests",
-)
+@requires_postgresql
 class TestMixedBackends:
     """Test SQLite and PostgreSQL databases in the same Datasette instance."""
 
     @pytest_asyncio.fixture
     async def mixed_client(self):
-        from datasette.backends.postgresql import PostgresBackend
         import psycopg
 
         # Create PostgreSQL schema

@@ -390,13 +390,6 @@ class Datasette:
         from .backends.sqlite import SQLiteBackend
 
         self._backend_registry = {"sqlite": SQLiteBackend}
-        if self.preview:
-            try:
-                from .backends.postgresql import PostgresBackend
-
-                self._backend_registry["postgresql"] = PostgresBackend
-            except ImportError:
-                pass
 
         self.cache_headers = cache_headers
         self.cors = cors
