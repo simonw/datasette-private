@@ -154,10 +154,42 @@ def test_metadata_yaml():
         ssl_certfile=None,
         return_instance=True,
         internal=None,
+        preview=False,
     )
     client = _TestClient(ds)
     response = client.get("/.json")
     assert {"title": "Hello from YAML"} == response.json["metadata"]
+
+
+def test_preview_false_by_default():
+    from datasette.app import Datasette
+
+    ds = Datasette()
+    assert ds.preview is False
+    # Without preview, only sqlite should be in the backend registry
+    assert "sqlite" in ds._backend_registry
+    assert "postgresql" not in ds._backend_registry
+
+
+def test_preview_enables_postgresql_backend():
+    from datasette.app import Datasette
+
+    ds = Datasette(preview=True)
+    assert ds.preview is True
+    # With preview and psycopg installed, postgresql should be registered
+    try:
+        import psycopg  # noqa: F401
+
+        assert "postgresql" in ds._backend_registry
+    except ImportError:
+        # psycopg not installed, that's fine - just check it didn't error
+        assert "postgresql" not in ds._backend_registry
+
+
+def test_preview_flag_cli():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["serve", "--preview", "--help-settings"])
+    assert result.exit_code == 0
 
 
 @mock.patch("datasette.cli.run_module")

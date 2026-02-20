@@ -407,16 +407,23 @@ class TestBackendRegistry:
         assert "sqlite" in ds._backend_registry
 
     @pytest.mark.asyncio
-    async def test_backend_registry_has_postgresql_when_available(self):
+    async def test_backend_registry_has_postgresql_when_preview(self):
         from datasette.app import Datasette
 
-        ds = Datasette()
+        ds = Datasette(preview=True)
         try:
             import psycopg  # noqa: F401
 
             assert "postgresql" in ds._backend_registry
         except ImportError:
             assert "postgresql" not in ds._backend_registry
+
+    @pytest.mark.asyncio
+    async def test_backend_registry_no_postgresql_without_preview(self):
+        from datasette.app import Datasette
+
+        ds = Datasette()
+        assert "postgresql" not in ds._backend_registry
 
     @pytest.mark.asyncio
     async def test_hookspec_exists(self):
@@ -447,6 +454,7 @@ class TestCLIConnectionStrings:
             cli,
             [
                 "serve",
+                "--preview",
                 POSTGRESQL_TEST_URL,
                 "--get",
                 "/.json",
@@ -458,6 +466,24 @@ class TestCLIConnectionStrings:
         data = json.loads(result.output)
         # Should have a database with the name from the connection string
         assert len(data.get("databases", [])) > 0
+
+    @requires_postgresql
+    def test_cli_connection_string_postgresql_requires_preview(self):
+        from click.testing import CliRunner
+        from datasette.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "serve",
+                POSTGRESQL_TEST_URL,
+                "--get",
+                "/.json",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Unknown database backend scheme" in result.output
 
     def test_cli_mixed_files_and_connection_strings(self, tmp_path):
         """SQLite files and connection strings can be mixed."""

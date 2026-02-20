@@ -496,6 +496,11 @@ def uninstall(packages, yes):
     type=click.Path(),
     help="Path to a persistent Datasette internal SQLite database",
 )
+@click.option(
+    "--preview",
+    is_flag=True,
+    help="Enable preview features, including support for alternative database backends",
+)
 def serve(
     files,
     immutable,
@@ -530,6 +535,7 @@ def serve(
     ssl_keyfile,
     ssl_certfile,
     internal,
+    preview,
     return_instance=False,
 ):
     """Serve up specified SQLite database files with a web UI"""
@@ -597,6 +603,7 @@ def serve(
         nolock=nolock,
         internal=internal,
         default_deny=default_deny,
+        preview=preview,
     )
 
     # Separate connection strings, directories, and file paths

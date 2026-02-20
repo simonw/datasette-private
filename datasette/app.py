@@ -322,8 +322,10 @@ class Datasette:
         nolock=False,
         internal=None,
         default_deny=False,
+        preview=False,
     ):
         self._startup_invoked = False
+        self.preview = preview
         assert config_dir is None or isinstance(
             config_dir, Path
         ), "config_dir= should be a pathlib.Path"
@@ -388,12 +390,13 @@ class Datasette:
         from .backends.sqlite import SQLiteBackend
 
         self._backend_registry = {"sqlite": SQLiteBackend}
-        try:
-            from .backends.postgresql import PostgresBackend
+        if self.preview:
+            try:
+                from .backends.postgresql import PostgresBackend
 
-            self._backend_registry["postgresql"] = PostgresBackend
-        except ImportError:
-            pass
+                self._backend_registry["postgresql"] = PostgresBackend
+            except ImportError:
+                pass
 
         self.cache_headers = cache_headers
         self.cors = cors
@@ -709,13 +712,14 @@ class Datasette:
                         action_abbrs[action.abbr] = action
                     self.actions[action.name] = action
 
-        # Register database backends from plugins
-        for hook in pm.hook.register_database_backends(datasette=self):
-            backends = await await_me_maybe(hook)
-            if backends:
-                for backend_cls in backends:
-                    if hasattr(backend_cls, "backend_type"):
-                        self._backend_registry[backend_cls.backend_type] = backend_cls
+        # Register database backends from plugins (preview feature)
+        if self.preview:
+            for hook in pm.hook.register_database_backends(datasette=self):
+                backends = await await_me_maybe(hook)
+                if backends:
+                    for backend_cls in backends:
+                        if hasattr(backend_cls, "backend_type"):
+                            self._backend_registry[backend_cls.backend_type] = backend_cls
 
         for hook in pm.hook.prepare_jinja2_environment(
             env=self._jinja_env, datasette=self
