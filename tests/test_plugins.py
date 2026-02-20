@@ -1265,7 +1265,7 @@ async def test_hook_register_database_backends():
         def register_database_backends(self, datasette):
             return [FakeBackend]
 
-    ds = Datasette()
+    ds = Datasette(preview=True)
     ds.pm.register(BackendPlugin(), name="BackendPlugin")
     await ds.invoke_startup()
     assert "fake" in ds._backend_registry

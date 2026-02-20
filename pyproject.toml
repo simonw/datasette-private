@@ -82,6 +82,7 @@ dev = [
 
 [project.optional-dependencies]
 rich = ["rich"]
+testing = ["pytest", "pytest-asyncio"]
 
 [build-system]
 requires = ["setuptools"]

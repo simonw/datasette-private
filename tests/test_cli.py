@@ -176,14 +176,9 @@ def test_preview_enables_postgresql_backend():
 
     ds = Datasette(preview=True)
     assert ds.preview is True
-    # With preview and psycopg installed, postgresql should be registered
-    try:
-        import psycopg  # noqa: F401
-
-        assert "postgresql" in ds._backend_registry
-    except ImportError:
-        # psycopg not installed, that's fine - just check it didn't error
-        assert "postgresql" not in ds._backend_registry
+    # PostgreSQL backend is now registered via plugin hook during invoke_startup,
+    # not during __init__. At init time only sqlite is present.
+    assert "sqlite" in ds._backend_registry
 
 
 def test_preview_flag_cli():
