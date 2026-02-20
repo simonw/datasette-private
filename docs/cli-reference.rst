@@ -136,6 +136,8 @@ Once started you can access it at ``http://localhost:8001``
                                       mode
       --ssl-keyfile TEXT              SSL key file
       --ssl-certfile TEXT             SSL certificate file
+      --preview                       Enable preview features, including support
+                                      for alternative database backends
       --internal PATH                 Path to a persistent Datasette internal SQLite
                                       database
       --help                          Show this message and exit.
@@ -221,6 +223,27 @@ Or you can make a request as a specific actor by passing a JSON representation o
 The exit code of ``datasette --get`` will be 0 if the request succeeds and 1 if the request produced an HTTP status code other than 200 - e.g. a 404 or 500 error.
 
 This lets you use ``datasette --get /`` to run tests against a Datasette application in a continuous integration environment such as GitHub Actions.
+
+.. _cli_datasette_serve_preview:
+
+datasette serve --preview
+-------------------------
+
+The ``--preview`` flag enables preview features that are not yet considered part of the stable Datasette API. Currently this enables:
+
+- **Alternative database backends**: Support for connecting to databases other than SQLite, such as PostgreSQL. Without ``--preview``, only the built-in SQLite backend is available.
+- **The** :ref:`plugin_hook_register_database_backends` **hook**: Plugins can register custom database backends, but these are only loaded when ``--preview`` is enabled.
+- **Connection string arguments**: You can pass connection strings (e.g. ``postgresql://localhost/mydb``) as database arguments instead of file paths.
+
+To serve a PostgreSQL database::
+
+    datasette serve --preview postgresql://localhost/mydb
+
+This requires the ``psycopg`` Python package to be installed::
+
+    datasette install psycopg
+
+Preview features may change or be removed in future releases. Once a preview feature is considered stable, it will be enabled by default without requiring ``--preview``.
 
 .. _cli_help_serve___help_settings:
 

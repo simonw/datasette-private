@@ -155,6 +155,10 @@ register_database_backends(datasette)
 ``datasette`` - :ref:`internals_datasette`
     You can use this to access plugin configuration options via ``datasette.plugin_config(your_plugin_name)``
 
+.. note::
+
+    This hook is a **preview feature** and is only active when Datasette is started with the ``--preview`` flag. See :ref:`cli_datasette_serve_preview` for details.
+
 This hook allows plugins to register custom database backend classes. Each backend class must be a subclass of ``DatabaseBackend`` and must define a ``backend_type`` class attribute (e.g. ``"sqlite"``, ``"postgresql"``). The ``backend_type`` is used when resolving which backend to use for a given database.
 
 Return a list of ``DatabaseBackend`` subclasses. These will be registered in Datasette's backend registry during startup, making them available for use with databases that specify a matching backend type.
